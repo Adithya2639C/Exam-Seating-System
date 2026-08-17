@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from "react"
 
 const ROOMS_API_URL =
-  "http://localhost:5000/api/rooms"
+  "https://smart-exam-backend-dg42.onrender.com/api/rooms"
 
 // ============================================================
 // CLASS KEY

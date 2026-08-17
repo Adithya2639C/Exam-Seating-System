@@ -1,6 +1,6 @@
 import { useState, useEffect } from "react"
 
-const API_URL = "http://localhost:5000/api/rooms"
+const API_URL = "https://smart-exam-backend-dg42.onrender.com/api/rooms"
 
 function Rooms() {
   // =========================================================

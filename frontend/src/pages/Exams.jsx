@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react"
 
-const API_URL = "http://localhost:5000/api/exams"
+const API_URL = "https://smart-exam-backend-dg42.onrender.com/api/exams"
 
 function Exams() {
   const [exams, setExams] = useState([])
