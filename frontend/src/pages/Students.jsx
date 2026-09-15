@@ -306,7 +306,7 @@ function Students() {
                 </h3>
 
                 <p className="text-sm text-slate-500 mt-1">
-                  Enter class strength only.
+                  Enter class, section and student strength.
                 </p>
 
               </div>
@@ -378,6 +378,14 @@ function Students() {
 
                 <option value="C">
                   Section C
+                </option>
+
+                <option value="D">
+                  Section D
+                </option>
+
+                <option value="E">
+                  Section E
                 </option>
 
               </select>

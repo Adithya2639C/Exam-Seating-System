@@ -7,29 +7,14 @@ import pdfWorker from "pdfjs-dist/build/pdf.worker.min.mjs?url"
 pdfjsLib.GlobalWorkerOptions.workerSrc = pdfWorker
 
 const TEACHERS_KEY = "invigilatorTeachers"
-const DAYS_KEY = "invigilationExamDays"
-const SCHEDULE_KEY = "invigilationDutySchedule"
-const EXAM_DAYS = 6
-const INVIGILATORS_PER_CLASS = 3
-const RULES = {
-  Teaching: { min: 5, max: 6 },
-  TGT: { min: 4, max: 5 },
-  PGT: { min: 3, max: 4 },
-  "Exam Department": { min: 3, max: 3 },
-  HighLoad: { min: 3, max: 4 },
-}
+const DAYS_KEY = "invigilationRoomExamDays"
+const SCHEDULE_KEY = "invigilationRoomDutySchedule"
+const FILE_NAME_KEY = "invigilationRoomTeacherFileName"
+const DEFAULT_EXAM_DAYS = 6
+const TEACHER_MAX_DUTIES = 999
 
 function makeId() {
   return `${Date.now()}-${Math.random().toString(36).slice(2)}`
-}
-
-function normalizeDesignation(value) {
-  const s = String(value || "").trim().toUpperCase()
-  if (s.includes("EXAM")) return "Exam Department"
-  if (s.includes("TGT")) return "TGT"
-  if (s.includes("PGT")) return "PGT"
-  if (s.includes("PRT") || s.includes("TEACH")) return "Teaching"
-  return String(value || "").trim() || "Teaching"
 }
 
 function cleanName(value) {
@@ -71,31 +56,21 @@ function rowsToTeachers(rows) {
     const keys = arrayRow ? [] : Object.keys(row)
 
     let name = ""
-    let designation = ""
-    let classesHandled = ""
-    let available = true
 
     if (keys.length) {
-      const nameKey = findKey(keys, ["teacher name", "employee name", "name of the employee", "employee", "teacher", "name"])
-      const designationKey = findKey(keys, ["designation", "post", "position", "role"])
-      const classKey = findKey(keys, ["classes handled", "number of classes", "no of classes", "classes"])
-      const availabilityKey = findKey(keys, ["availability", "available"])
-
-      name = cleanName(nameKey ? row[nameKey] : "")
-      designation = normalizeDesignation(designationKey ? row[designationKey] : "")
-      classesHandled = classKey ? String(row[classKey] ?? "") : ""
-
-      if (availabilityKey) {
-        const a = String(row[availabilityKey] ?? "").toLowerCase()
-        available = !(a === "no" || a === "false" || a === "unavailable")
-      }
+      const nameKey = findKey(keys, [
+        "teacher name",
+        "employee name",
+        "name of the employee",
+        "employee",
+        "teacher",
+        "name",
+      ])
+      name = cleanName(nameKey ? row[nameKey] : values[0])
     } else {
       const nonEmpty = values.map((v) => String(v ?? "").trim()).filter(Boolean)
       if (!nonEmpty.length) continue
       name = cleanName(nonEmpty[0])
-      designation = normalizeDesignation(
-        nonEmpty.find((v) => /PGT|TGT|PRT|exam department/i.test(v)) || ""
-      )
     }
 
     if (!name || isHeader(name)) continue
@@ -103,10 +78,9 @@ function rowsToTeachers(rows) {
     imported.push({
       id: makeId(),
       name,
-      designation,
-      classesHandled,
-      available,
-      isExamHead: false,
+      minDuties: "",
+      maxDuties: "",
+      unavailableDays: [],
     })
   }
 
@@ -117,6 +91,24 @@ function rowsToTeachers(rows) {
     seen.add(key)
     return true
   })
+}
+
+function normalizeTeacher(teacher) {
+  const unavailableDays = Array.isArray(teacher?.unavailableDays)
+    ? teacher.unavailableDays.map(Number).filter(Number.isFinite)
+    : []
+
+  const oldPreferred = teacher?.preferredDuties
+  const minValue = teacher?.minDuties ?? (oldPreferred !== undefined && oldPreferred !== "" ? oldPreferred : "")
+  const maxValue = teacher?.maxDuties ?? (oldPreferred !== undefined && oldPreferred !== "" ? oldPreferred : "")
+
+  return {
+    id: teacher?.id ?? makeId(),
+    name: String(teacher?.name ?? "").trim(),
+    minDuties: minValue,
+    maxDuties: maxValue,
+    unavailableDays: [...new Set(unavailableDays)],
+  }
 }
 
 function parseCSV(text) {
@@ -147,7 +139,7 @@ function parseCSV(text) {
 
   if (!rows.length) return []
   const headers = rows[0].map((x) => String(x).toLowerCase().trim())
-  const hasHeader = headers.some((x) => /name|employee|teacher|designation|post|role/.test(x))
+  const hasHeader = headers.some((x) => /name|employee|teacher/.test(x))
   if (!hasHeader) return rowsToTeachers(rows)
 
   return rowsToTeachers(rows.slice(1).map((row) => {
@@ -163,13 +155,11 @@ async function parseDOCX(buffer) {
     .split(/\r?\n/)
     .map((x) => x.trim())
     .filter(Boolean)
-    .filter((line) => !/staff list|contractual teachers|sl\.?\s*no|designation/i.test(line))
+    .filter((line) => !/staff list|contractual teachers|sl\.?\s*no/i.test(line))
     .map((line) => {
-      const match = line.match(/^(.*?)(PGT|TGT|PRT|Exam Department|Principal|Vice Principal|Librarian|JSA|DEO|Instructor|Coach|Counsellor|Nurse|Educator).*$/i)
-      if (match) return [match[1], match[2]]
       if (line.includes("\t")) return line.split("\t").map((x) => x.trim())
       if (/\s{2,}/.test(line)) return line.split(/\s{2,}/).map((x) => x.trim())
-      return [line, ""]
+      return [line]
     })
   return rowsToTeachers(rows)
 }
@@ -221,141 +211,337 @@ async function parseTeacherFile(file) {
   throw new Error("Unsupported file format. Use DOCX, PDF, XLSX, XLS, ODS, CSV, TXT, or JSON.")
 }
 
-function getRange(teacher) {
-  if (Number(teacher.classesHandled || 0) > 6) return RULES.HighLoad
-  const d = normalizeDesignation(teacher.designation)
-  if (d === "TGT") return RULES.TGT
-  if (d === "PGT") return RULES.PGT
-  if (d === "Exam Department") return RULES["Exam Department"]
-  return RULES.Teaching
+function getDutyRange(teacher, totalDays) {
+  const fallbackMax = Math.max(1, Number(totalDays) || 1)
+  let min = Number(teacher?.minDuties)
+  let max = Number(teacher?.maxDuties)
+
+  if (!Number.isFinite(min) || min < 0) min = 0
+  if (!Number.isFinite(max) || max < 0) max = fallbackMax
+  if (max > fallbackMax) max = fallbackMax
+  if (min > max) min = max
+
+  return { min, max }
 }
 
-function isExamHead(teacher) {
-  const d = String(teacher.designation || "").toLowerCase()
-  const n = String(teacher.name || "").toLowerCase()
-  return Boolean(teacher.isExamHead) ||
-    (d.includes("exam") && (d.includes("head") || d.includes("hod") || d.includes("coordinator"))) ||
-    (n.includes("head") && d.includes("exam"))
+function isTeacherAvailableOnDay(teacher, dayId) {
+  return !Array.isArray(teacher?.unavailableDays) || !teacher.unavailableDays.includes(Number(dayId))
 }
 
-function createExamDays(classes) {
-  return Array.from({ length: EXAM_DAYS }, (_, i) => ({
-    id: i + 1,
-    name: `Exam Day ${i + 1}`,
-    date: "",
-    classes: classes.map((c) => ({
-      key: `${c.classNumber}${c.section}`,
-      classNumber: c.classNumber,
-      section: c.section,
-      strength: Number(c.strength || 0),
-    })),
-  }))
+function isTeacherUnavailableForAllDays(teacher, days) {
+  if (!Array.isArray(days) || days.length === 0) return false
+  const unavailable = new Set((teacher?.unavailableDays || []).map(Number))
+  return days.every((day) => unavailable.has(Number(day.id)))
 }
 
-function chooseTeacher(teachers, counts, dayCounts, usedToday, previousExtraIds, relaxExtra) {
-  const candidates = teachers
-    .filter((t) => t.available !== false)
-    .filter((t) => !usedToday.has(t.id))
-    .filter((t) => relaxExtra || !previousExtraIds.has(t.id))
-    .filter((t) => counts[t.id] < getRange(t).max)
-    .sort((a, b) => {
-      if (previousExtraIds.has(a.id) !== previousExtraIds.has(b.id)) {
-        return previousExtraIds.has(a.id) ? 1 : -1
+function getEffectiveDutyRange(teacher, days) {
+  if (isTeacherUnavailableForAllDays(teacher, days)) {
+    return { min: 0, max: 0 }
+  }
+  return getDutyRange(teacher, days.length)
+}
+
+
+function loadSeatingReport() {
+  try {
+    const saved = localStorage.getItem("generatedSeatingReport")
+    if (!saved) return null
+    const parsed = JSON.parse(saved)
+    return parsed && Array.isArray(parsed.rooms) ? parsed : null
+  } catch (error) {
+    console.error("Failed to load seating report:", error)
+    return null
+  }
+}
+
+function getExamRoomsForDay(day) {
+  const report = loadSeatingReport()
+  if (!report || !Array.isArray(day?.rooms)) return []
+
+  return day.rooms
+    .map((selectedRoom) => {
+      const room = report.rooms.find(
+        (item) => String(item.roomId) === String(selectedRoom.roomId)
+      )
+      if (!room) return null
+
+      const classes = []
+      const seenClasses = new Set()
+
+      ;(room.seats || []).forEach((seat) => {
+        const student = seat.student
+        if (!student) return
+        const classKey = student.classKey || `${student.classNumber}${student.section || ""}`
+        if (seenClasses.has(classKey)) return
+        seenClasses.add(classKey)
+        classes.push({
+          classKey,
+          classNumber: student.classNumber,
+          section: student.section || "",
+        })
+      })
+
+      return {
+        roomId: room.roomId,
+        roomName: room.roomName,
+        roomType: room.roomType,
+        assignedStudents: Number(room.assignedStudents || 0),
+        classes,
       }
-      if (counts[a.id] !== counts[b.id]) return counts[a.id] - counts[b.id]
-      if (dayCounts[a.id] !== dayCounts[b.id]) return dayCounts[a.id] - dayCounts[b.id]
-      return a.name.localeCompare(b.name)
     })
-  return candidates[0] || null
+    .filter(Boolean)
 }
 
-function generateSchedule(teachers, days) {
-  const available = teachers.filter((t) => t.available !== false)
-  const heads = teachers.filter(isExamHead)
+function getRoomInvigilatorCount(room, day) {
+  if (!room) return 0
+
+  if (room.roomType === "Large Hall") {
+    const selected = Number(day?.roomInvigilators?.[room.roomId])
+    return selected === 4 ? 4 : 3
+  }
+
+  return 1
+}
+
+function createExamDays(classes, count = DEFAULT_EXAM_DAYS) {
+  return Array.from(
+    { length: Math.max(1, Number(count) || DEFAULT_EXAM_DAYS) },
+    (_, i) => ({
+      id: i + 1,
+      name: `Exam Day ${i + 1}`,
+      date: "",
+      rooms: [],
+      roomInvigilators: {},
+    })
+  )
+}
+
+function chooseTeacher(teachers, counts, dayCounts, usedToday, dayId, totalDays) {
+  const candidates = teachers
+    .filter((t) => isTeacherAvailableOnDay(t, dayId))
+    .filter((t) => !usedToday.has(t.id))
+    .filter((t) => counts[t.id] < getDutyRange(t, totalDays).max)
+
+  return candidates.sort((a, b) => {
+    const rangeA = getDutyRange(a, totalDays)
+    const rangeB = getDutyRange(b, totalDays)
+    const deficitA = Math.max(0, rangeA.min - counts[a.id])
+    const deficitB = Math.max(0, rangeB.min - counts[b.id])
+
+    // First satisfy minimum-duty requirements.
+    if (deficitA !== deficitB) return deficitB - deficitA
+
+    // Then prefer teachers who are still below their maximum.
+    const roomA = Math.max(0, rangeA.max - counts[a.id])
+    const roomB = Math.max(0, rangeB.max - counts[b.id])
+    if (roomA !== roomB) return roomB - roomA
+
+    // Keep the total duty load balanced.
+    if (counts[a.id] !== counts[b.id]) return counts[a.id] - counts[b.id]
+    if (dayCounts[a.id] !== dayCounts[b.id]) return dayCounts[a.id] - dayCounts[b.id]
+    return a.name.localeCompare(b.name)
+  })[0] || null
+}
+
+function getDayEligibleTeacherIds(teachers, counts, usedToday, dayId, totalDays) {
+  return teachers
+    .filter((teacher) => isTeacherAvailableOnDay(teacher, dayId))
+    .filter((teacher) => !usedToday.has(teacher.id))
+    .filter((teacher) => counts[teacher.id] < getDutyRange(teacher, totalDays).max)
+    .map((teacher) => teacher.id)
+}
+
+function tryGenerateSchedule(teachers, days) {
   const counts = Object.fromEntries(teachers.map((t) => [t.id, 0]))
   const dayCounts = Object.fromEntries(teachers.map((t) => [t.id, 0]))
   const result = []
-  let previousExtraIds = new Set()
+  const shortages = []
+  const totalDays = days.length
 
   for (const day of days) {
     const usedToday = new Set()
-    const currentExtraIds = new Set()
     const assignments = []
+    const rooms = getExamRoomsForDay(day)
 
-    for (const cls of day.classes) {
+    for (const room of rooms) {
+      const required = getRoomInvigilatorCount(room, day)
+      if (required <= 0) continue
+
       const assignment = {
         dayId: day.id,
-        classKey: cls.key,
-        classNumber: cls.classNumber,
-        section: cls.section,
-        strength: cls.strength,
+        roomId: room.roomId,
+        roomName: room.roomName,
+        roomType: room.roomType,
+        classes: room.classes || [],
+        strength: Number(room.assignedStudents || 0),
+        required,
         teachers: [],
       }
 
-      for (let i = 0; i < INVIGILATORS_PER_CLASS; i++) {
-        let teacher = chooseTeacher(
-          available,
+      for (let i = 0; i < required; i++) {
+        const teacher = chooseTeacher(
+          teachers,
           counts,
           dayCounts,
           usedToday,
-          previousExtraIds,
-          false
+          day.id,
+          totalDays
         )
+
         if (!teacher) {
-          teacher = chooseTeacher(
-            available,
+          const eligibleCount = getDayEligibleTeacherIds(
+            teachers,
             counts,
-            dayCounts,
             usedToday,
-            previousExtraIds,
-            true
-          )
+            day.id,
+            totalDays
+          ).length
+
+          shortages.push({
+            dayId: day.id,
+            name: day.name || `Exam Day ${day.id}`,
+            required: rooms.reduce(
+              (sum, item) => sum + getRoomInvigilatorCount(item, day),
+              0
+            ),
+            assigned: assignments.reduce(
+              (sum, item) => sum + (item.teachers || []).filter(Boolean).length,
+              0
+            ) + assignment.teachers.length,
+            shortage: required - i,
+            eligibleCount,
+          })
+          break
         }
-        if (!teacher) break
 
         assignment.teachers.push({
           teacherId: teacher.id,
           teacherName: teacher.name,
-          designation: teacher.designation,
           role: "Regular",
         })
+
         usedToday.add(teacher.id)
         counts[teacher.id]++
         dayCounts[teacher.id]++
       }
 
-      while (assignment.teachers.length < INVIGILATORS_PER_CLASS) {
-        const head = heads
-          .filter((t) => !usedToday.has(t.id))
-          .sort((a, b) => counts[a.id] - counts[b.id])[0]
-        if (!head) break
-        assignment.teachers.push({
-          teacherId: head.id,
-          teacherName: head.name,
-          designation: head.designation,
-          role: "Extra / Head",
-        })
-        usedToday.add(head.id)
-        currentExtraIds.add(head.id)
-        counts[head.id]++
-        dayCounts[head.id]++
+      if (assignment.teachers.length < required) {
+        break
       }
 
-      while (assignment.teachers.length < INVIGILATORS_PER_CLASS) {
+      assignments.push(assignment)
+    }
+
+    if (shortages.length) {
+      return { schedule: [], shortages }
+    }
+
+    result.push({
+      dayId: day.id,
+      name: day.name,
+      date: day.date,
+      assignments,
+    })
+  }
+
+  return { schedule: result, shortages: [] }
+}
+
+function formatDutyShortageMessage(details) {
+  if (!details.length) return ""
+
+  const lines = details.map((item) => {
+    const teacherWord = item.eligibleCount === 1 ? "teacher is" : "teachers are"
+    const shortageWord = item.shortage === 1 ? "teacher" : "teachers"
+    return `${item.name}: ${item.required} invigilators required, but only ${item.eligibleCount} ${teacherWord} eligible. ${item.shortage} more ${shortageWord} required.`
+  })
+
+  return `Not enough teachers for the duty schedule.\n\n${lines.join("\n")}\n\nThe duty schedule was not generated. Please remove some leave days, increase teachers' maximum duty limits, add more teachers, or reduce the required invigilators.`
+}
+
+function hasCompleteSchedule(schedule, days) {
+  if (!Array.isArray(schedule) || schedule.length !== days.length) return false
+
+  return days.every((day) => {
+    const generatedDay = schedule.find(
+      (item) => Number(item.dayId) === Number(day.id)
+    )
+    if (!generatedDay) return false
+
+    return generatedDay.assignments.every((assignment) =>
+      (assignment.teachers || []).filter(Boolean).length >= Number(assignment.required || 0)
+    )
+  })
+}
+
+function generateSchedule(teachers, days) {
+  const counts = Object.fromEntries(teachers.map((t) => [t.id, 0]))
+  const dayCounts = Object.fromEntries(teachers.map((t) => [t.id, 0]))
+  const result = []
+  const totalDays = days.length
+
+  for (const day of days) {
+    const usedToday = new Set()
+    const assignments = []
+    const rooms = getExamRoomsForDay(day)
+
+    for (const room of rooms) {
+      const required = getRoomInvigilatorCount(room, day)
+      if (required <= 0) continue
+
+      const assignment = {
+        dayId: day.id,
+        roomId: room.roomId,
+        roomName: room.roomName,
+        roomType: room.roomType,
+        classes: room.classes || [],
+        strength: Number(room.assignedStudents || 0),
+        required,
+        teachers: [],
+      }
+
+      for (let i = 0; i < required; i++) {
+        const teacher = chooseTeacher(
+          teachers,
+          counts,
+          dayCounts,
+          usedToday,
+          day.id,
+          totalDays
+        )
+
+        if (!teacher) break
+
+        assignment.teachers.push({
+          teacherId: teacher.id,
+          teacherName: teacher.name,
+          role: "Regular",
+        })
+
+        usedToday.add(teacher.id)
+        counts[teacher.id]++
+        dayCounts[teacher.id]++
+      }
+
+      while (assignment.teachers.length < required) {
         assignment.teachers.push(null)
       }
 
       assignments.push(assignment)
     }
 
-    previousExtraIds = currentExtraIds
-    result.push({ dayId: day.id, name: day.name, date: day.date, assignments })
+    result.push({
+      dayId: day.id,
+      name: day.name,
+      date: day.date,
+      assignments,
+    })
   }
+
   return result
 }
 
 function Invigilators() {
-  const [classes, setClasses] = useState([])
   const [teachers, setTeachers] = useState([])
   const [examDays, setExamDays] = useState([])
   const [schedule, setSchedule] = useState([])
@@ -363,79 +549,228 @@ function Invigilators() {
   const [loadingFile, setLoadingFile] = useState(false)
   const [showAdd, setShowAdd] = useState(false)
   const [editing, setEditing] = useState(null)
+  const [replacementSelection, setReplacementSelection] = useState(null)
+  const [replacementTeacherId, setReplacementTeacherId] = useState("")
+  const [openAvailabilityTeacherId, setOpenAvailabilityTeacherId] = useState(null)
+  const [dataLoaded, setDataLoaded] = useState(false)
   const fileRef = useRef(null)
+  const availabilityRef = useRef(null)
 
   const [newTeacher, setNewTeacher] = useState({
     name: "",
-    designation: "Teaching",
-    classesHandled: "",
-    available: true,
-    isExamHead: false,
+    minDuties: "",
+    maxDuties: "",
+    unavailableDays: [],
   })
 
   useEffect(() => {
     try {
-      const savedClasses = localStorage.getItem("examClasses")
-      const cls = savedClasses ? JSON.parse(savedClasses) : []
-      const validClasses = Array.isArray(cls) ? cls : []
-      setClasses(validClasses)
-
       const savedTeachers = localStorage.getItem(TEACHERS_KEY)
-      if (savedTeachers) setTeachers(JSON.parse(savedTeachers))
+      if (savedTeachers) {
+        const parsedTeachers = JSON.parse(savedTeachers)
+        setTeachers(
+          Array.isArray(parsedTeachers)
+            ? parsedTeachers.map(normalizeTeacher).filter((teacher) => teacher.name)
+            : []
+        )
+      }
+
+      const savedFileName = localStorage.getItem(FILE_NAME_KEY)
+      if (savedFileName) setFileName(savedFileName)
 
       const savedDays = localStorage.getItem(DAYS_KEY)
-      setExamDays(
-        savedDays
-          ? JSON.parse(savedDays)
-          : createExamDays(validClasses)
-      )
+
+      if (savedDays) {
+        const parsedDays = JSON.parse(savedDays)
+
+        const normalizedDays = Array.isArray(parsedDays)
+          ? parsedDays
+              .filter((day) => Array.isArray(day.rooms))
+              .map((day, index) => ({
+                id: day.id ?? index + 1,
+                name: day.name || `Exam Day ${index + 1}`,
+                date: day.date || "",
+                rooms: day.rooms,
+                roomInvigilators: day.roomInvigilators || {},
+              }))
+          : []
+
+        setExamDays(
+          normalizedDays.length ? normalizedDays : createExamDays()
+        )
+      } else {
+        setExamDays(createExamDays())
+      }
 
       const savedSchedule = localStorage.getItem(SCHEDULE_KEY)
-      if (savedSchedule) setSchedule(JSON.parse(savedSchedule))
+      if (savedSchedule) {
+        const parsedSchedule = JSON.parse(savedSchedule)
+        const isRoomWiseSchedule =
+          Array.isArray(parsedSchedule) &&
+          parsedSchedule.every(
+            (day) =>
+              Array.isArray(day.assignments) &&
+              day.assignments.every(
+                (assignment) =>
+                  assignment &&
+                  assignment.roomId &&
+                  assignment.roomName &&
+                  Number(assignment.required || 0) > 0
+              )
+          )
+
+        if (isRoomWiseSchedule && parsedSchedule.every((day) => (day.assignments || []).every((assignment) => {
+          const required = Number(assignment.required || 0)
+          const assigned = (assignment.teachers || []).filter(Boolean).length
+          return assigned >= required
+        }))) {
+          setSchedule(parsedSchedule)
+        } else {
+          localStorage.removeItem(SCHEDULE_KEY)
+          setSchedule([])
+        }
+      }
     } catch (error) {
       console.error(error)
       alert("Failed to load invigilation data.")
+    } finally {
+      setDataLoaded(true)
     }
   }, [])
 
   useEffect(() => {
+    if (!dataLoaded) return
     localStorage.setItem(TEACHERS_KEY, JSON.stringify(teachers))
-  }, [teachers])
+  }, [teachers, dataLoaded])
 
   useEffect(() => {
-    if (examDays.length === EXAM_DAYS) {
-      localStorage.setItem(DAYS_KEY, JSON.stringify(examDays))
-    }
-  }, [examDays])
+    if (!dataLoaded) return
+    localStorage.setItem(DAYS_KEY, JSON.stringify(examDays))
+  }, [examDays, dataLoaded])
 
-  const totalClasses = useMemo(
-    () => examDays.reduce((n, d) => n + d.classes.length, 0),
+  useEffect(() => {
+    if (!dataLoaded) return
+    localStorage.setItem(FILE_NAME_KEY, fileName || "")
+  }, [fileName, dataLoaded])
+
+  useEffect(() => {
+    function handleOutsideClick(event) {
+      if (!availabilityRef.current?.contains(event.target)) {
+        setOpenAvailabilityTeacherId(null)
+      }
+    }
+
+    document.addEventListener("mousedown", handleOutsideClick)
+    return () => document.removeEventListener("mousedown", handleOutsideClick)
+  }, [])
+
+  useEffect(() => {
+    if (!dataLoaded) return
+    if (schedule.length > 0) {
+      localStorage.setItem(SCHEDULE_KEY, JSON.stringify(schedule))
+    }
+  }, [schedule, dataLoaded])
+
+  const totalRooms = useMemo(
+    () =>
+      examDays.reduce(
+        (n, d) =>
+          n +
+          (Array.isArray(d.rooms) ? d.rooms.length : 0),
+        0
+      ),
     [examDays]
   )
 
-  const requiredDuties = totalClasses * INVIGILATORS_PER_CLASS
+  const requiredDuties = useMemo(() => {
+    return examDays.reduce((total, day) => {
+      return (
+        total +
+        getExamRoomsForDay(day).reduce(
+          (sum, room) =>
+            sum + getRoomInvigilatorCount(room, day),
+          0
+        )
+      )
+    }, 0)
+  }, [examDays])
 
   const assignedDuties = schedule.reduce(
     (n, d) => n + d.assignments.reduce((m, a) => m + a.teachers.filter(Boolean).length, 0),
     0
   )
 
-  const extraDuties = schedule.reduce(
-    (n, d) =>
-      n +
-      d.assignments.reduce(
-        (m, a) => m + a.teachers.filter((t) => t && t.role !== "Regular").length,
-        0
-      ),
-    0
-  )
 
   function updateTeacher(id, field, value) {
     setTeachers((current) =>
-      current.map((t) =>
-        t.id === id ? { ...t, [field]: value } : t
-      )
+      current.map((t) => {
+        if (t.id !== id) return t
+
+        const next = { ...t, [field]: value }
+        const min = next.minDuties === "" ? null : Number(next.minDuties)
+        const max = next.maxDuties === "" ? null : Number(next.maxDuties)
+
+        if (field === "minDuties" && max !== null && Number.isFinite(min) && min > max) {
+          alert("Minimum duties cannot be greater than maximum duties.")
+          return t
+        }
+        if (field === "maxDuties" && min !== null && Number.isFinite(max) && max < min) {
+          alert("Maximum duties cannot be less than minimum duties.")
+          return t
+        }
+
+        return next
+      })
     )
+    setSchedule([])
+    localStorage.removeItem(SCHEDULE_KEY)
+  }
+
+  function applyTeacherAvailabilityChange(nextTeachers) {
+    setTeachers(nextTeachers)
+
+    if (schedule.length > 0) {
+      const attempt = tryGenerateSchedule(nextTeachers, examDays)
+
+      if (attempt.shortages.length) {
+        setSchedule([])
+        localStorage.removeItem(SCHEDULE_KEY)
+        alert(formatDutyShortageMessage(attempt.shortages))
+        return
+      }
+
+      setSchedule(attempt.schedule)
+      localStorage.setItem(SCHEDULE_KEY, JSON.stringify(attempt.schedule))
+    } else {
+      setSchedule([])
+      localStorage.removeItem(SCHEDULE_KEY)
+    }
+  }
+
+  function toggleTeacherLeaveDay(id, dayId) {
+    const numericDayId = Number(dayId)
+    const nextTeachers = teachers.map((teacher) => {
+      if (String(teacher.id) !== String(id)) return teacher
+      const days = Array.isArray(teacher.unavailableDays) ? teacher.unavailableDays : []
+      const nextDays = days.includes(numericDayId)
+        ? days.filter((d) => d !== numericDayId)
+        : [...days, numericDayId]
+      return {
+        ...teacher,
+        unavailableDays: [...new Set(nextDays)].sort((a, b) => a - b),
+      }
+    })
+
+    applyTeacherAvailabilityChange(nextTeachers)
+  }
+
+  function clearTeacherLeave(id) {
+    const nextTeachers = teachers.map((teacher) =>
+      String(teacher.id) === String(id)
+        ? { ...teacher, unavailableDays: [] }
+        : teacher
+    )
+    applyTeacherAvailabilityChange(nextTeachers)
   }
 
   function addTeacher() {
@@ -443,13 +778,34 @@ function Invigilators() {
       alert("Please enter the teacher name.")
       return
     }
-    setTeachers((current) => [...current, { ...newTeacher, id: makeId() }])
+
+    const min = newTeacher.minDuties === ""
+      ? ""
+      : String(Math.max(0, Number(newTeacher.minDuties) || 0))
+    const max = newTeacher.maxDuties === ""
+      ? ""
+      : String(Math.max(0, Number(newTeacher.maxDuties) || 0))
+
+    if (min !== "" && max !== "" && Number(min) > Number(max)) {
+      alert("Minimum duties cannot be greater than maximum duties.")
+      return
+    }
+
+    setTeachers((current) => [
+      ...current,
+      {
+        id: makeId(),
+        name: newTeacher.name.trim(),
+        minDuties: min,
+        maxDuties: max,
+        unavailableDays: [...new Set(newTeacher.unavailableDays || [])],
+      },
+    ])
     setNewTeacher({
       name: "",
-      designation: "Teaching",
-      classesHandled: "",
-      available: true,
-      isExamHead: false,
+      minDuties: "",
+      maxDuties: "",
+      unavailableDays: [],
     })
     setShowAdd(false)
   }
@@ -483,7 +839,7 @@ function Invigilators() {
           const key = t.name.toLowerCase().replace(/\s+/g, " ").trim()
           if (!map.has(key)) map.set(key, t)
         }
-        return [...map.values()]
+        return [...map.values()].map(normalizeTeacher)
       })
       alert(`Imported ${imported.length} teacher records.`)
     } catch (error) {
@@ -495,6 +851,42 @@ function Invigilators() {
     }
   }
 
+  function addExamDay() {
+    setSchedule([])
+    localStorage.removeItem(SCHEDULE_KEY)
+
+    setExamDays((current) => {
+      const nextId = current.reduce((max, day) => Math.max(max, Number(day.id) || 0), 0) + 1
+      return [
+        ...current,
+        {
+          id: nextId,
+          name: `Exam Day ${nextId}`,
+          date: "",
+          rooms: [],
+          roomInvigilators: {},
+        },
+      ]
+    })
+  }
+
+  function removeExamDay(dayId) {
+    if (examDays.length <= 1) {
+      alert("At least one exam day is required.")
+      return
+    }
+
+    setSchedule([])
+    localStorage.removeItem(SCHEDULE_KEY)
+    setExamDays((current) => current.filter((day) => day.id !== dayId))
+    setTeachers((current) =>
+      current.map((teacher) => ({
+        ...teacher,
+        unavailableDays: (teacher.unavailableDays || []).filter((id) => Number(id) !== Number(dayId)),
+      }))
+    )
+  }
+
   function updateDay(dayId, field, value) {
     setExamDays((current) =>
       current.map((day) =>
@@ -503,39 +895,65 @@ function Invigilators() {
     )
   }
 
-  function toggleClass(dayId, classItem) {
-    const key = `${classItem.classNumber}${classItem.section}`
+  function toggleRoom(dayId, room) {
+    setSchedule([])
+    localStorage.removeItem(SCHEDULE_KEY)
+
+    const roomId = String(room.roomId)
+
     setExamDays((current) =>
       current.map((day) => {
         if (day.id !== dayId) return day
-        const exists = day.classes.some((c) => c.key === key)
+
+        const currentRooms = Array.isArray(day.rooms)
+          ? day.rooms
+          : []
+
+        const exists = currentRooms.some(
+          (item) => String(item.roomId) === roomId
+        )
+
         return {
           ...day,
-          classes: exists
-            ? day.classes.filter((c) => c.key !== key)
-            : [...day.classes, {
-                key,
-                classNumber: classItem.classNumber,
-                section: classItem.section,
-                strength: Number(classItem.strength || 0),
-              }],
+          rooms: exists
+            ? currentRooms.filter(
+                (item) => String(item.roomId) !== roomId
+              )
+            : [
+                ...currentRooms,
+                {
+                  roomId: room.roomId,
+                  roomName: room.roomName,
+                  roomType: room.roomType,
+                },
+              ],
         }
       })
     )
   }
 
-  function selectAll(dayId) {
+  function selectAllRooms(dayId) {
+    const report = loadSeatingReport()
+    const availableRooms = report?.rooms || []
+
+    setSchedule([])
+    localStorage.removeItem(SCHEDULE_KEY)
+
     setExamDays((current) =>
       current.map((day) =>
         day.id === dayId
           ? {
               ...day,
-              classes: classes.map((c) => ({
-                key: `${c.classNumber}${c.section}`,
-                classNumber: c.classNumber,
-                section: c.section,
-                strength: Number(c.strength || 0),
-              })),
+              rooms: availableRooms
+                .filter(
+                  (room) =>
+                    Number(room.assignedStudents || 0) > 0
+                )
+                .map((room) => ({
+                  roomId: room.roomId,
+                  roomName: room.roomName,
+                  roomType: room.roomType,
+                })),
             }
           : day
       )
@@ -543,9 +961,18 @@ function Invigilators() {
   }
 
   function clearDay(dayId) {
+    setSchedule([])
+    localStorage.removeItem(SCHEDULE_KEY)
+
     setExamDays((current) =>
       current.map((day) =>
-        day.id === dayId ? { ...day, classes: [] } : day
+        day.id === dayId
+          ? {
+              ...day,
+              rooms: [],
+              roomInvigilators: {},
+            }
+          : day
       )
     )
   }
@@ -555,48 +982,218 @@ function Invigilators() {
       alert("Import or add teachers first.")
       return
     }
-    if (examDays.some((day) => day.classes.length === 0)) {
-      alert("Select at least one class for every exam day.")
+    if (examDays.some((day) => !Array.isArray(day.rooms) || day.rooms.length === 0)) {
+      alert("Select at least one examination room for every exam day.")
       return
     }
-    const result = generateSchedule(teachers, examDays)
-    setSchedule(result)
-    localStorage.setItem(SCHEDULE_KEY, JSON.stringify(result))
-    alert("Six-day invigilation duty schedule generated.")
+
+    if (!loadSeatingReport()) {
+      alert("Generate the seating arrangement first so the Invigilators page can use the actual exam rooms and student counts.")
+      return
+    }
+
+    const attempt = tryGenerateSchedule(teachers, examDays)
+
+    // Do not display or save a partial schedule.
+    if (attempt.shortages.length || !hasCompleteSchedule(attempt.schedule, examDays)) {
+      setSchedule([])
+      localStorage.removeItem(SCHEDULE_KEY)
+      alert(formatDutyShortageMessage(attempt.shortages))
+      return
+    }
+
+    setSchedule(attempt.schedule)
+    localStorage.setItem(SCHEDULE_KEY, JSON.stringify(attempt.schedule))
+
+    const assignedCounts = Object.fromEntries(teachers.map((teacher) => [teacher.id, 0]))
+    attempt.schedule.forEach((day) =>
+      day.assignments.forEach((assignment) =>
+        assignment.teachers.forEach((teacher) => {
+          if (teacher && assignedCounts[teacher.teacherId] !== undefined) {
+            assignedCounts[teacher.teacherId]++
+          }
+        })
+      )
+    )
+
+    const unmetMinimums = teachers
+      .filter((teacher) => !isTeacherUnavailableForAllDays(teacher, examDays))
+      .filter((teacher) => assignedCounts[teacher.id] < getEffectiveDutyRange(teacher, examDays).min)
+      .map((teacher) => teacher.name)
+
+    if (unmetMinimums.length) {
+      alert(
+        `Schedule generated successfully. Some teachers could not reach their minimum preferred duty limit: ${unmetMinimums.join(", ")}. All required duty slots are assigned.`
+      )
+    } else {
+      alert(
+        `${examDays.length}-day invigilation duty schedule generated successfully. All required duty slots are assigned.`
+      )
+    }
   }
 
-  function replaceTeacher(dayId, classKey, teacherIndex, teacherId) {
-    const teacher = teachers.find((t) => String(t.id) === String(teacherId))
-    if (!teacher) return
+  function getTeacherAssignedCount(teacherId) {
+    return schedule.reduce(
+      (count, day) =>
+        count +
+        day.assignments.reduce(
+          (sum, assignment) =>
+            sum +
+            (assignment.teachers || []).filter(
+              (teacher) => teacher && String(teacher.teacherId) === String(teacherId)
+            ).length,
+          0
+        ),
+      0
+    )
+  }
+
+  function getTeacherDayAssignedCount(dayId, teacherId) {
+    const day = schedule.find((item) => Number(item.dayId) === Number(dayId))
+    if (!day) return 0
+    return day.assignments.reduce(
+      (sum, assignment) =>
+        sum +
+        (assignment.teachers || []).filter(
+          (teacher) => teacher && String(teacher.teacherId) === String(teacherId)
+        ).length,
+      0
+    )
+  }
+
+  function getReplacementCandidates(dayId, currentTeacherId) {
+    return teachers
+      .filter((teacher) => String(teacher.id) !== String(currentTeacherId))
+      .filter((teacher) => isTeacherAvailableOnDay(teacher, dayId))
+      .filter((teacher) => getTeacherDayAssignedCount(dayId, teacher.id) === 0)
+      .filter((teacher) => {
+        const range = getEffectiveDutyRange(teacher, examDays)
+        const total = getTeacherAssignedCount(teacher.id)
+        return total < range.max
+      })
+      .sort((a, b) => {
+        const rangeA = getEffectiveDutyRange(a, examDays)
+        const rangeB = getEffectiveDutyRange(b, examDays)
+        const countA = getTeacherAssignedCount(a.id)
+        const countB = getTeacherAssignedCount(b.id)
+
+        // Teachers who are still below their minimum come first.
+        const deficitA = Math.max(0, rangeA.min - countA)
+        const deficitB = Math.max(0, rangeB.min - countB)
+        if (deficitA !== deficitB) return deficitB - deficitA
+
+        // Then teachers with fewer total duties.
+        if (countA !== countB) return countA - countB
+
+        return a.name.localeCompare(b.name)
+      })
+  }
+
+  function getReplacementStatus(dayId, currentTeacherId) {
+    const candidates = getReplacementCandidates(dayId, currentTeacherId)
+    if (candidates.length > 0) return { candidates, reason: "" }
+
+    const available = teachers
+      .filter((teacher) => String(teacher.id) !== String(currentTeacherId))
+      .filter((teacher) => isTeacherAvailableOnDay(teacher, dayId))
+
+    const freeToday = available.filter(
+      (teacher) => getTeacherDayAssignedCount(dayId, teacher.id) === 0
+    )
+
+    const underMax = freeToday.filter((teacher) => {
+      const range = getEffectiveDutyRange(teacher, examDays)
+      return getTeacherAssignedCount(teacher.id) < range.max
+    })
+
+    if (available.length === 0) {
+      return { candidates: [], reason: "No other teacher is available on this exam day." }
+    }
+
+    if (freeToday.length === 0) {
+      return { candidates: [], reason: "Every other available teacher already has a duty on this exam day." }
+    }
+
+    if (underMax.length === 0) {
+      return { candidates: [], reason: "Every other available teacher has already reached their maximum duty limit." }
+    }
+
+    return { candidates: [], reason: "No eligible replacement teacher is available." }
+  }
+
+  function openReplacementEditor(dayId, roomId, teacherIndex, currentTeacherId) {
+    const candidates = getReplacementCandidates(dayId, currentTeacherId)
+    setReplacementSelection({ dayId, roomId, teacherIndex, currentTeacherId })
+    setReplacementTeacherId(candidates[0]?.id ? String(candidates[0].id) : "")
+    setEditing(null)
+  }
+
+  function cancelReplacement() {
+    setReplacementSelection(null)
+    setReplacementTeacherId("")
+  }
+
+  function confirmReplacement() {
+    if (!replacementSelection) return
+
+    const { dayId, roomId, teacherIndex, currentTeacherId } = replacementSelection
+    const candidates = getReplacementCandidates(dayId, currentTeacherId)
+    const teacher = candidates.find(
+      (item) => String(item.id) === String(replacementTeacherId)
+    )
+
+    if (!teacher) {
+      alert("Please select an eligible replacement teacher.")
+      return
+    }
+
+    const range = getEffectiveDutyRange(teacher, examDays)
+    const currentCount = getTeacherAssignedCount(teacher.id)
+    if (currentCount >= range.max) {
+      alert(`${teacher.name} has already reached the maximum preferred duty limit.`)
+      return
+    }
+
+    if (!isTeacherAvailableOnDay(teacher, dayId)) {
+      alert("This teacher is marked unavailable on this exam day.")
+      return
+    }
+
+    if (getTeacherDayAssignedCount(dayId, teacher.id) > 0) {
+      alert("This teacher already has a duty on this exam day.")
+      return
+    }
+
     setSchedule((current) => {
       const updated = current.map((day) =>
-        day.dayId === dayId
+        Number(day.dayId) === Number(dayId)
           ? {
               ...day,
-              assignments: day.assignments.map((a) =>
-                a.classKey === classKey
+              assignments: day.assignments.map((assignment) =>
+                String(assignment.roomId) === String(roomId)
                   ? {
-                      ...a,
-                      teachers: a.teachers.map((t, index) =>
+                      ...assignment,
+                      teachers: assignment.teachers.map((slotTeacher, index) =>
                         index === teacherIndex
                           ? {
                               teacherId: teacher.id,
                               teacherName: teacher.name,
-                              designation: teacher.designation,
                               role: "Manual",
                             }
-                          : t
+                          : slotTeacher
                       ),
                     }
-                  : a
+                  : assignment
               ),
             }
           : day
       )
+
       localStorage.setItem(SCHEDULE_KEY, JSON.stringify(updated))
       return updated
     })
-    setEditing(null)
+
+    cancelReplacement()
   }
 
   function printReport() {
@@ -604,35 +1201,42 @@ function Invigilators() {
   }
 
   const teacherSummary = useMemo(() => {
-    return teachers.map((teacher) => {
-      let duties = 0
-      let extra = 0
-      const days = []
-      schedule.forEach((day) => {
-        day.assignments.forEach((a) => {
-          a.teachers.forEach((t) => {
-            if (t && String(t.teacherId) === String(teacher.id)) {
-              duties++
-              if (t.role !== "Regular") extra++
-              days.push(day.dayId)
-            }
-          })
-        })
+    return teachers
+      .filter((teacher) => !isTeacherUnavailableForAllDays(teacher, examDays))
+      .map((teacher) => {
+        let duties = 0
+        const days = []
+        schedule.forEach((day) => day.assignments.forEach((assignment) => assignment.teachers.forEach((t) => {
+          if (t && String(t.teacherId) === String(teacher.id)) {
+            duties++
+            days.push(day.dayId)
+          }
+        })))
+
+        const range = getEffectiveDutyRange(teacher, examDays)
+        const status = duties < range.min
+          ? "Below Minimum"
+          : duties > range.max
+            ? "Above Maximum"
+            : "Within Range"
+
+        return {
+          ...teacher,
+          duties,
+          minDuties: range.min,
+          maxDuties: range.max,
+          status,
+          days: [...new Set(days)].sort((a, b) => a - b),
+        }
       })
-      const range = getRange(teacher)
-      let status = "Preferred"
-      if (duties < range.min) status = "Below Preferred"
-      if (duties > range.max) status = "Above Preferred"
-      return { ...teacher, duties, extra, range, status, days: [...new Set(days)].sort((a, b) => a - b) }
-    })
-  }, [teachers, schedule])
+  }, [teachers, schedule, examDays])
 
   return (
     <div className="min-h-screen bg-slate-50 p-8">
       <div className="flex flex-wrap items-start justify-between gap-4 mb-8">
         <div>
           <h2 className="text-3xl font-bold text-slate-900">Invigilators Duty</h2>
-          <p className="mt-2 text-slate-500">Import teachers, select classes for six exam days, and generate a fair duty schedule.</p>
+          <p className="mt-2 text-slate-500">Import teachers, set the required number of exam days, and generate a fair duty schedule.</p>
         </div>
         <div className="flex flex-wrap gap-3">
           <input
@@ -661,57 +1265,128 @@ function Invigilators() {
         {fileName && <p className="mt-3 text-sm text-green-600">Last file: {fileName}</p>}
       </div>
 
-      <div className="bg-white rounded-2xl border border-slate-200 overflow-hidden mb-8">
+      <div className="bg-white rounded-2xl border border-slate-200 overflow-visible mb-8">
         <div className="px-6 py-5 border-b border-slate-200 flex justify-between items-center">
           <div>
             <h3 className="text-lg font-bold">Teachers</h3>
-            <p className="text-sm text-slate-500">Review imported data before generating duties.</p>
+            <p className="text-sm text-slate-500">
+              Set a minimum and maximum duty range and click <b>Available</b> to choose the exam days on which a teacher is on leave.
+            </p>
           </div>
-          {!!teachers.length && <button onClick={clearTeachers} className="px-3 py-2 rounded-lg border border-red-200 text-red-600">Clear All</button>}
+          {teachers.length > 0 && (
+            <button onClick={clearTeachers} className="px-4 py-2 rounded-xl border border-red-200 text-red-600 font-semibold">
+              Clear All
+            </button>
+          )}
         </div>
+
         {!teachers.length ? (
-          <div className="p-10 text-center text-slate-400">No teachers imported yet.</div>
+          <div className="p-10 text-center text-slate-500">No teachers added yet.</div>
         ) : (
-          <div className="overflow-x-auto">
+          <div className="overflow-x-auto" ref={availabilityRef}>
             <table className="w-full">
               <thead className="bg-slate-50">
                 <tr>
                   <th className="px-4 py-3 text-left">Teacher</th>
-                  <th className="px-4 py-3 text-left">Designation</th>
-                  <th className="px-4 py-3 text-left">Classes</th>
-                  <th className="px-4 py-3 text-left">Preferred</th>
+                  <th className="px-4 py-3 text-left">Preferred Duties</th>
                   <th className="px-4 py-3 text-left">Available</th>
-                  <th className="px-4 py-3 text-left">Exam Head</th>
                   <th className="px-4 py-3 text-right">Action</th>
                 </tr>
               </thead>
               <tbody>
                 {teachers.map((teacher) => {
-                  const range = getRange(teacher)
+                  const leaveDays = (teacher.unavailableDays || []).map(Number)
+                  const isOpen = String(openAvailabilityTeacherId) === String(teacher.id)
                   return (
-                    <tr key={teacher.id} className="border-t border-slate-200">
-                      <td className="px-4 py-3">
-                        <input value={teacher.name} onChange={(e) => updateTeacher(teacher.id, "name", e.target.value)} className="min-w-[220px] px-3 py-2 rounded-lg border" />
+                    <tr key={teacher.id} className="border-t border-slate-200 align-top">
+                      <td className="px-4 py-4">
+                        <input
+                          value={teacher.name}
+                          onChange={(e) => updateTeacher(teacher.id, "name", e.target.value)}
+                          className="min-w-[240px] px-3 py-2 rounded-lg border"
+                        />
                       </td>
-                      <td className="px-4 py-3">
-                        <input value={teacher.designation} onChange={(e) => updateTeacher(teacher.id, "designation", e.target.value)} className="min-w-[160px] px-3 py-2 rounded-lg border" />
+                      <td className="px-4 py-4">
+                        <div className="flex items-center gap-2">
+                          <input
+                            type="number"
+                            min="0"
+                            step="1"
+                            value={teacher.minDuties ?? ""}
+                            onChange={(e) => updateTeacher(teacher.id, "minDuties", e.target.value)}
+                            placeholder="Min"
+                            className="w-24 px-3 py-2 rounded-lg border"
+                          />
+                          <span className="text-slate-400">to</span>
+                          <input
+                            type="number"
+                            min="0"
+                            step="1"
+                            value={teacher.maxDuties ?? ""}
+                            onChange={(e) => updateTeacher(teacher.id, "maxDuties", e.target.value)}
+                            placeholder="Max"
+                            className="w-24 px-3 py-2 rounded-lg border"
+                          />
+                        </div>
                       </td>
-                      <td className="px-4 py-3">
-                        <input type="number" min="0" value={teacher.classesHandled} onChange={(e) => updateTeacher(teacher.id, "classesHandled", e.target.value)} className="w-20 px-3 py-2 rounded-lg border" />
-                      </td>
-                      <td className="px-4 py-3">{range.min}–{range.max}</td>
-                      <td className="px-4 py-3">
-                        <button onClick={() => updateTeacher(teacher.id, "available", teacher.available === false)} className={teacher.available !== false ? "px-3 py-2 rounded-lg bg-green-50 text-green-600" : "px-3 py-2 rounded-lg bg-red-50 text-red-600"}>
-                          {teacher.available !== false ? "Available" : "Unavailable"}
+                      <td className="px-4 py-4 relative">
+                        <button
+                          type="button"
+                          onClick={() => setOpenAvailabilityTeacherId(isOpen ? null : teacher.id)}
+                          className={leaveDays.length === 0
+                            ? "px-4 py-2 rounded-lg bg-green-50 text-green-700 font-semibold"
+                            : "px-4 py-2 rounded-lg bg-amber-50 text-amber-700 font-semibold"}
+                        >
+                          {leaveDays.length === 0
+                            ? "Available"
+                            : `${leaveDays.length} Day${leaveDays.length === 1 ? "" : "s"} Leave`}
                         </button>
+
+                        {isOpen && (
+                          <div className="absolute left-0 top-full mt-2 z-50 w-72 bg-white border border-slate-200 rounded-xl shadow-xl p-4">
+                            <div className="flex items-center justify-between mb-3">
+                              <div>
+                                <div className="font-bold text-slate-900">Leave Days</div>
+                                <div className="text-xs text-slate-500">Select the exam days this teacher will be absent.</div>
+                              </div>
+                              {leaveDays.length > 0 && (
+                                <button
+                                  type="button"
+                                  onClick={() => clearTeacherLeave(teacher.id)}
+                                  className="text-xs text-red-600 font-semibold"
+                                >
+                                  Clear
+                                </button>
+                              )}
+                            </div>
+
+                            <div className="space-y-2 max-h-64 overflow-y-auto">
+                              {examDays.map((day) => {
+                                const checked = leaveDays.includes(Number(day.id))
+                                return (
+                                  <label key={day.id} className="flex items-center gap-3 p-2 rounded-lg hover:bg-slate-50 cursor-pointer">
+                                    <input
+                                      type="checkbox"
+                                      checked={checked}
+                                      onChange={() => toggleTeacherLeaveDay(teacher.id, day.id)}
+                                      className="w-4 h-4"
+                                    />
+                                    <span className="text-sm font-medium text-slate-800">
+                                      {day.name}{day.date ? ` — ${day.date}` : ""}
+                                    </span>
+                                  </label>
+                                )
+                              })}
+                            </div>
+                          </div>
+                        )}
+
+                        <div className="text-xs text-slate-500 mt-2">
+                          {leaveDays.length ? `Leave: ${leaveDays.map((id) => examDays.find((d) => Number(d.id) === id)?.name || `Day ${id}`).join(", ")}` : "No leave selected"}
+                        </div>
                       </td>
-                      <td className="px-4 py-3">
-                        <button onClick={() => updateTeacher(teacher.id, "isExamHead", !teacher.isExamHead)} className={teacher.isExamHead ? "px-3 py-2 rounded-lg bg-purple-50 text-purple-600" : "px-3 py-2 rounded-lg bg-slate-50 text-slate-500"}>
-                          {teacher.isExamHead ? "Head" : "Set Head"}
-                        </button>
-                      </td>
-                      <td className="px-4 py-3 text-right">
-                        <button onClick={() => removeTeacher(teacher.id)} className="text-red-500">Delete</button>
+                      <td className="px-4 py-4 text-right">
+                        <button onClick={() => removeTeacher(teacher.id)} className="text-red-500 font-semibold">Delete</button>
                       </td>
                     </tr>
                   )
@@ -723,50 +1398,251 @@ function Invigilators() {
       </div>
 
       <div className="space-y-6 mb-8">
-        {examDays.map((day) => (
-          <div key={day.id} className="bg-white rounded-2xl border border-slate-200 p-6">
-            <div className="flex flex-wrap justify-between items-center gap-4 mb-5">
-              <div>
-                <input value={day.name} onChange={(e) => updateDay(day.id, "name", e.target.value)} className="text-lg font-bold border rounded-lg px-2 py-1" />
-                <input type="date" value={day.date} onChange={(e) => updateDay(day.id, "date", e.target.value)} className="block mt-2 px-2 py-1 rounded-lg border text-sm" />
-              </div>
-              <div className="flex gap-2">
-                <button onClick={() => selectAll(day.id)} className="px-3 py-2 rounded-lg bg-blue-50 text-blue-600">Select All</button>
-                <button onClick={() => clearDay(day.id)} className="px-3 py-2 rounded-lg border">Clear</button>
-              </div>
-            </div>
+        <div className="mb-4 rounded-xl border border-blue-100 bg-blue-50 p-4 text-sm text-blue-700">
+          Select the examination rooms used on each day. Classroom/Lab = 1 invigilator. Large Hall = 3 or 4 invigilators.
+        </div>
 
-            <div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-6 gap-3">
-              {classes.map((cls) => {
-                const key = `${cls.classNumber}${cls.section}`
-                const active = day.classes.some((c) => c.key === key)
-                return (
-                  <button key={key} onClick={() => toggleClass(day.id, cls)} className={active ? "p-4 rounded-xl border-2 border-blue-500 bg-blue-50 text-left" : "p-4 rounded-xl border-2 border-slate-200 text-left"}>
-                    <div className="font-bold">{cls.classNumber}{cls.section}</div>
-                    <div className="text-xs text-slate-500 mt-1">{cls.strength} students</div>
+        <div className="flex justify-end">
+          <button
+            onClick={addExamDay}
+            className="px-5 py-3 rounded-xl bg-blue-600 text-white font-semibold hover:bg-blue-700"
+          >
+            + Add Exam Day
+          </button>
+        </div>
+
+        {examDays.map((day) => {
+          const report = loadSeatingReport()
+          const availableRooms = (report?.rooms || []).filter(
+            (room) => Number(room.assignedStudents || 0) > 0
+          )
+          const selectedRoomIds = new Set(
+            (day.rooms || []).map((room) => String(room.roomId))
+          )
+          const selectedRoomsForDay = getExamRoomsForDay(day)
+
+          return (
+            <div
+              key={day.id}
+              className="bg-white rounded-2xl border border-slate-200 p-6"
+            >
+              <div className="flex flex-wrap justify-between items-center gap-4 mb-5">
+                <div>
+                  <input
+                    value={day.name}
+                    onChange={(e) =>
+                      updateDay(day.id, "name", e.target.value)
+                    }
+                    className="text-lg font-bold border rounded-lg px-2 py-1"
+                  />
+                  <input
+                    type="date"
+                    value={day.date}
+                    onChange={(e) =>
+                      updateDay(day.id, "date", e.target.value)
+                    }
+                    className="block mt-2 px-2 py-1 rounded-lg border text-sm"
+                  />
+                </div>
+
+                <div className="flex flex-wrap gap-2">
+                  <button
+                    onClick={() => selectAllRooms(day.id)}
+                    disabled={!availableRooms.length}
+                    className="px-3 py-2 rounded-lg bg-blue-50 text-blue-600 disabled:opacity-40"
+                  >
+                    Select All Rooms
                   </button>
-                )
-              })}
-            </div>
 
-            <div className="mt-5 flex gap-4">
-              <div className="p-3 rounded-xl bg-slate-50"><div className="text-xs text-slate-500">Classes</div><div className="text-xl font-bold">{day.classes.length}</div></div>
-              <div className="p-3 rounded-xl bg-slate-50"><div className="text-xs text-slate-500">Required</div><div className="text-xl font-bold">{day.classes.length * INVIGILATORS_PER_CLASS}</div></div>
+                  <button
+                    onClick={() => clearDay(day.id)}
+                    className="px-3 py-2 rounded-lg border"
+                  >
+                    Clear
+                  </button>
+
+                  <button
+                    onClick={() => removeExamDay(day.id)}
+                    className="px-3 py-2 rounded-lg border border-red-200 text-red-600"
+                  >
+                    Remove Exam
+                  </button>
+                </div>
+              </div>
+
+              {!report ? (
+                <div className="p-5 rounded-xl bg-amber-50 border border-amber-200 text-sm text-amber-700">
+                  Generate a seating arrangement first. The rooms shown here will
+                  come directly from that seating arrangement.
+                </div>
+              ) : availableRooms.length === 0 ? (
+                <div className="p-5 rounded-xl bg-slate-50 border border-slate-200 text-sm text-slate-500">
+                  No rooms with assigned students were found in the latest seating arrangement.
+                </div>
+              ) : (
+                <>
+                  <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3">
+                    {availableRooms.map((room) => {
+                      const selected = selectedRoomIds.has(
+                        String(room.roomId)
+                      )
+
+                      const required =
+                        room.roomType === "Large Hall"
+                          ? (day.roomInvigilators?.[room.roomId] === 4 ? 4 : 3)
+                          : 1
+
+                      const roomClasses = [
+                        ...new Set(
+                          (room.seats || [])
+                            .filter((seat) => seat.student)
+                            .map(
+                              (seat) =>
+                                seat.student.displayNumber
+                                  ? `${seat.student.classNumber}${seat.student.section || ""}`
+                                  : ""
+                            )
+                            .filter(Boolean)
+                        ),
+                      ]
+
+                      return (
+                        <div
+                          key={room.roomId}
+                          className={
+                            selected
+                              ? "rounded-xl border-2 border-blue-500 bg-blue-50 p-4"
+                              : "rounded-xl border-2 border-slate-200 bg-white p-4"
+                          }
+                        >
+                          <button
+                            onClick={() => toggleRoom(day.id, room)}
+                            className="w-full text-left"
+                          >
+                            <div className="flex items-start justify-between gap-3">
+                              <div>
+                                <div className="font-bold text-slate-900">
+                                  {room.roomName}
+                                </div>
+                                <div className="text-xs text-slate-500 mt-1">
+                                  {room.roomType}
+                                </div>
+                              </div>
+
+                              <div
+                                className={
+                                  selected
+                                    ? "w-6 h-6 rounded-md bg-blue-600 text-white flex items-center justify-center text-xs font-bold"
+                                    : "w-6 h-6 rounded-md border-2 border-slate-300 text-transparent flex items-center justify-center text-xs font-bold"
+                                }
+                              >
+                                ✓
+                              </div>
+                            </div>
+
+                            <div className="grid grid-cols-2 gap-2 mt-4">
+                              <div className="p-3 rounded-lg bg-white/80">
+                                <div className="text-[11px] text-slate-500">
+                                  Students
+                                </div>
+                                <div className="font-bold text-slate-800">
+                                  {room.assignedStudents}
+                                </div>
+                              </div>
+
+                              <div className="p-3 rounded-lg bg-white/80">
+                                <div className="text-[11px] text-slate-500">
+                                  Classes
+                                </div>
+                                <div className="font-bold text-slate-800 text-sm">
+                                  {roomClasses.join(", ") || "-"}
+                                </div>
+                              </div>
+                            </div>
+                          </button>
+
+                          <div className="mt-4 pt-4 border-t border-slate-200 flex items-center justify-between gap-3">
+                            <span className="text-sm font-semibold text-slate-700">
+                              Required
+                            </span>
+
+                            {room.roomType === "Large Hall" ? (
+                              <select
+                                value={required}
+                                onChange={(e) =>
+                                  updateRoomInvigilators(
+                                    day.id,
+                                    room.roomId,
+                                    e.target.value
+                                  )
+                                }
+                                className="px-3 py-2 rounded-lg border bg-white font-semibold"
+                              >
+                                <option value={3}>3 Invigilators</option>
+                                <option value={4}>4 Invigilators</option>
+                              </select>
+                            ) : (
+                              <span className="px-3 py-2 rounded-lg bg-blue-50 text-blue-600 font-semibold">
+                                1 Invigilator
+                              </span>
+                            )}
+                          </div>
+                        </div>
+                      )
+                    })}
+                  </div>
+
+                  <div className="mt-5 flex flex-wrap gap-4">
+                    <div className="p-3 rounded-xl bg-slate-50">
+                      <div className="text-xs text-slate-500">Rooms</div>
+                      <div className="text-xl font-bold">
+                        {selectedRoomsForDay.length}
+                      </div>
+                    </div>
+
+                    <div className="p-3 rounded-xl bg-slate-50">
+                      <div className="text-xs text-slate-500">
+                        Students
+                      </div>
+                      <div className="text-xl font-bold">
+                        {selectedRoomsForDay.reduce(
+                          (sum, room) =>
+                            sum + Number(room.assignedStudents || 0),
+                          0
+                        )}
+                      </div>
+                    </div>
+
+                    <div className="p-3 rounded-xl bg-slate-50">
+                      <div className="text-xs text-slate-500">
+                        Invigilators Required
+                      </div>
+                      <div className="text-xl font-bold">
+                        {selectedRoomsForDay.reduce(
+                          (sum, room) =>
+                            sum + getRoomInvigilatorCount(room, day),
+                          0
+                        )}
+                      </div>
+                    </div>
+                  </div>
+                </>
+              )}
             </div>
-          </div>
-        ))}
+          )
+        })}
       </div>
 
       <div className="bg-white rounded-2xl border border-slate-200 p-6 mb-8">
         <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-          <div><div className="text-xs text-slate-500">Exam Days</div><div className="text-3xl font-bold">6</div></div>
-          <div><div className="text-xs text-slate-500">Total Classes</div><div className="text-3xl font-bold">{totalClasses}</div></div>
+          <div><div className="text-xs text-slate-500">Exam Days</div><div className="text-3xl font-bold">{examDays.length}</div></div>
+          <div><div className="text-xs text-slate-500">Total Rooms</div><div className="text-3xl font-bold">{totalRooms}</div></div>
           <div><div className="text-xs text-slate-500">Duties Required</div><div className="text-3xl font-bold">{requiredDuties}</div></div>
           <div><div className="text-xs text-slate-500">Teachers</div><div className="text-3xl font-bold">{teachers.length}</div></div>
         </div>
         <div className="flex justify-end gap-3 mt-6">
           {schedule.length > 0 && <button onClick={() => { setSchedule([]); localStorage.removeItem(SCHEDULE_KEY) }} className="px-5 py-3 rounded-xl border border-red-200 text-red-600">Clear Generated Duty</button>}
-          <button onClick={generate} disabled={!teachers.length || examDays.some((d) => !d.classes.length)} className="px-6 py-3 rounded-xl bg-blue-600 text-white font-semibold disabled:opacity-40">Generate Duty Schedule</button>
+          <button onClick={generate} disabled={!teachers.length || examDays.some((d) => !Array.isArray(d.rooms) || !d.rooms.length)} className="px-6 py-3 rounded-xl bg-blue-600 text-white font-semibold disabled:opacity-40">Generate Duty Schedule</button>
         </div>
       </div>
 
@@ -776,15 +1652,14 @@ function Invigilators() {
             <div className="flex justify-between items-center gap-4">
               <div>
                 <h2 className="text-2xl font-bold">Invigilation Duty Schedule</h2>
-                <p className="text-sm text-slate-500 mt-1">Six-day examination duty report</p>
+                <p className="text-sm text-slate-500 mt-1">{examDays.length}-day room-wise examination duty report</p>
               </div>
               <button onClick={printReport} className="px-5 py-3 rounded-xl bg-slate-800 text-white print:hidden">Print Report</button>
             </div>
             <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mt-5">
               <div><div className="text-xs text-slate-500">Required</div><div className="text-2xl font-bold">{requiredDuties}</div></div>
               <div><div className="text-xs text-slate-500">Assigned</div><div className="text-2xl font-bold text-blue-600">{assignedDuties}</div></div>
-              <div><div className="text-xs text-slate-500">Extra</div><div className="text-2xl font-bold text-amber-600">{extraDuties}</div></div>
-              <div><div className="text-xs text-slate-500">Teachers</div><div className="text-2xl font-bold">{teachers.length}</div></div>
+                  <div><div className="text-xs text-slate-500">Teachers</div><div className="text-2xl font-bold">{teachers.length}</div></div>
             </div>
           </div>
 
@@ -798,34 +1673,97 @@ function Invigilators() {
                 <table className="w-full">
                   <thead className="bg-slate-50">
                     <tr>
-                      <th className="px-5 py-4 text-left">Class</th>
+                      <th className="px-5 py-4 text-left">Room</th>
+                      <th className="px-5 py-4 text-left">Type</th>
+                      <th className="px-5 py-4 text-left">Classes</th>
                       <th className="px-5 py-4 text-left">Students</th>
                       <th className="px-5 py-4 text-left">Invigilator 1</th>
                       <th className="px-5 py-4 text-left">Invigilator 2</th>
                       <th className="px-5 py-4 text-left">Invigilator 3</th>
+                      <th className="px-5 py-4 text-left">Invigilator 4</th>
                     </tr>
                   </thead>
                   <tbody>
                     {day.assignments.map((a) => (
-                      <tr key={a.classKey} className="border-t border-slate-200">
-                        <td className="px-5 py-4 font-bold">{a.classNumber}{a.section}</td>
+                      <tr key={a.roomId} className="border-t border-slate-200">
+                        <td className="px-5 py-4 font-bold">{a.roomName}</td>
+                        <td className="px-5 py-4">{a.roomType}</td>
+                        <td className="px-5 py-4">{(a.classes || []).map((c) => c.classKey).join(", ") || "-"}</td>
                         <td className="px-5 py-4">{a.strength}</td>
-                        {[0, 1, 2].map((index) => {
+                        {[0, 1, 2, 3].map((index) => {
                           const t = a.teachers[index]
                           return (
                             <td key={index} className="px-5 py-4">
-                              {!t ? (
-                                <span className="text-red-500 font-semibold">Unassigned</span>
-                              ) : editing?.dayId === day.dayId && editing?.classKey === a.classKey && editing?.index === index ? (
-                                <select value={t.teacherId} onChange={(e) => replaceTeacher(day.dayId, a.classKey, index, e.target.value)} className="w-full min-w-[180px] px-3 py-2 rounded-lg border">
-                                  {teachers.map((option) => <option key={option.id} value={option.id}>{option.name}</option>)}
-                                </select>
+                              {index >= a.required ? (
+                                <span className="text-slate-300">—</span>
+                              ) : !t ? (
+                                null
+                              ) : replacementSelection?.dayId === day.dayId && String(replacementSelection?.roomId) === String(a.roomId) && replacementSelection?.teacherIndex === index ? (
+                                <div className="min-w-[270px] rounded-xl border border-blue-200 bg-blue-50 p-3">
+                                  <div className="text-xs font-semibold text-slate-500 mb-2">Replace {t.teacherName}</div>
+                                  {(() => {
+                                    const replacementInfo = getReplacementStatus(day.dayId, t.teacherId)
+                                    return replacementInfo.candidates.length > 0 ? (
+                                      <select
+                                        value={replacementTeacherId}
+                                        onChange={(e) => setReplacementTeacherId(e.target.value)}
+                                        className="w-full px-3 py-2 rounded-lg border bg-white text-sm"
+                                      >
+                                        <option value="">Select replacement teacher</option>
+                                        {replacementInfo.candidates.map((option) => {
+                                          const range = getEffectiveDutyRange(option, examDays)
+                                          const count = getTeacherAssignedCount(option.id)
+                                          const needsDuty = count < range.min
+                                          return (
+                                            <option key={option.id} value={option.id}>
+                                              {option.name} — {count}/{range.max} {needsDuty ? "(preferred duty left)" : ""}
+                                            </option>
+                                          )
+                                        })}
+                                      </select>
+                                    ) : (
+                                      <div className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-700">
+                                        {replacementInfo.reason}
+                                      </div>
+                                    )
+                                  })()}
+                                  <div className="flex gap-2 mt-2">
+                                    <button
+                                      type="button"
+                                      onClick={confirmReplacement}
+                                      disabled={!replacementTeacherId}
+                                      className="px-3 py-2 rounded-lg bg-blue-600 text-white text-xs font-semibold disabled:opacity-40"
+                                    >
+                                      Replace
+                                    </button>
+                                    <button
+                                      type="button"
+                                      onClick={cancelReplacement}
+                                      className="px-3 py-2 rounded-lg border bg-white text-slate-600 text-xs font-semibold"
+                                    >
+                                      Cancel
+                                    </button>
+                                  </div>
+                                </div>
                               ) : (
-                                <button onClick={() => setEditing({ dayId: day.dayId, classKey: a.classKey, index })} className="text-left p-2 rounded-lg hover:bg-slate-50">
-                                  <div className="font-semibold">{t.teacherName}</div>
-                                  <div className="text-xs text-slate-500 mt-1">{t.designation}</div>
-                                  {t.role !== "Regular" && <span className="inline-block mt-1 px-2 py-1 rounded bg-amber-50 text-amber-600 text-[10px] font-semibold">EXTRA</span>}
-                                </button>
+                                <div className="flex items-center gap-2">
+                                  <button
+                                    type="button"
+                                    onClick={() => openReplacementEditor(day.dayId, a.roomId, index, t.teacherId)}
+                                    className="text-left p-2 rounded-lg hover:bg-slate-50"
+                                    title="Replace this invigilator manually"
+                                  >
+                                    <div className="font-semibold">{t.teacherName}</div>
+                                    {t.role !== "Regular" && <span className="inline-block mt-1 px-2 py-1 rounded bg-amber-50 text-amber-600 text-[10px] font-semibold">EXTRA</span>}
+                                  </button>
+                                  <button
+                                    type="button"
+                                    onClick={() => openReplacementEditor(day.dayId, a.roomId, index, t.teacherId)}
+                                    className="px-2 py-1 rounded-md border border-blue-200 text-blue-600 text-[10px] font-semibold hover:bg-blue-50 print:hidden"
+                                  >
+                                    Replace
+                                  </button>
+                                </div>
                               )}
                             </td>
                           )
@@ -845,49 +1783,30 @@ function Invigilators() {
                 <thead className="bg-slate-50">
                   <tr>
                     <th className="px-5 py-4 text-left">Teacher</th>
-                    <th className="px-5 py-4 text-left">Designation</th>
-                    <th className="px-5 py-4 text-left">Classes</th>
-                    <th className="px-5 py-4 text-left">Preferred</th>
+                    <th className="px-5 py-4 text-left">Preferred Duties</th>
                     <th className="px-5 py-4 text-left">Assigned</th>
-                    <th className="px-5 py-4 text-left">Extra</th>
                     <th className="px-5 py-4 text-left">Status</th>
                     <th className="px-5 py-4 text-left">Days</th>
                   </tr>
                 </thead>
                 <tbody>
-                  {teachers.map((teacher) => {
-                    const row = (() => {
-                      let duties = 0
-                      let extra = 0
-                      const days = []
-                      schedule.forEach((day) => day.assignments.forEach((a) => a.teachers.forEach((t) => {
-                        if (t && String(t.teacherId) === String(teacher.id)) {
-                          duties++
-                          if (t.role !== "Regular") extra++
-                          days.push(day.dayId)
-                        }
-                      })))
-                      const range = getRange(teacher)
-                      const status = duties < range.min ? "Below Preferred" : duties > range.max ? "Above Preferred" : "Preferred"
-                      return { duties, extra, days: [...new Set(days)].sort((a, b) => a - b), range, status }
-                    })()
-                    return (
-                      <tr key={teacher.id} className="border-t border-slate-200">
-                        <td className="px-5 py-4 font-semibold">{teacher.name}</td>
-                        <td className="px-5 py-4">{teacher.designation}</td>
-                        <td className="px-5 py-4">{teacher.classesHandled || 0}</td>
-                        <td className="px-5 py-4">{row.range.min}–{row.range.max}</td>
-                        <td className="px-5 py-4 font-bold">{row.duties}</td>
-                        <td className="px-5 py-4">{row.extra}</td>
-                        <td className="px-5 py-4">
-                          <span className={row.status === "Preferred" ? "px-3 py-1 rounded-lg bg-green-50 text-green-600" : row.status === "Above Preferred" ? "px-3 py-1 rounded-lg bg-red-50 text-red-600" : "px-3 py-1 rounded-lg bg-amber-50 text-amber-600"}>
-                            {row.status}
-                          </span>
-                        </td>
-                        <td className="px-5 py-4 text-sm">{row.days.map((d) => `Day ${d}`).join(", ") || "-"}</td>
-                      </tr>
-                    )
-                  })}
+                  {teacherSummary.map((row) => (
+                    <tr key={row.id} className="border-t border-slate-200">
+                      <td className="px-5 py-4 font-semibold">{row.name}</td>
+                      <td className="px-5 py-4">{row.minDuties}–{row.maxDuties}</td>
+                      <td className="px-5 py-4 font-bold">{row.duties}</td>
+                      <td className="px-5 py-4">
+                        <span className={row.status === "Within Range"
+                          ? "px-3 py-1 rounded-lg bg-green-50 text-green-600"
+                          : row.status === "Above Maximum"
+                            ? "px-3 py-1 rounded-lg bg-red-50 text-red-600"
+                            : "px-3 py-1 rounded-lg bg-amber-50 text-amber-600"}>
+                          {row.status}
+                        </span>
+                      </td>
+                      <td className="px-5 py-4 text-sm">{row.days.map((d) => `Day ${d}`).join(", ") || "-"}</td>
+                    </tr>
+                  ))}
                 </tbody>
               </table>
             </div>
@@ -904,28 +1823,35 @@ function Invigilators() {
             </div>
 
             <label className="block text-sm font-semibold mb-2">Teacher Name</label>
-            <input value={newTeacher.name} onChange={(e) => setNewTeacher((x) => ({ ...x, name: e.target.value }))} className="w-full px-4 py-3 rounded-xl border mb-5" />
+            <input
+              value={newTeacher.name}
+              onChange={(e) => setNewTeacher((x) => ({ ...x, name: e.target.value }))}
+              className="w-full px-4 py-3 rounded-xl border mb-5"
+              placeholder="Enter teacher name"
+            />
 
-            <label className="block text-sm font-semibold mb-2">Designation</label>
-            <select value={newTeacher.designation} onChange={(e) => setNewTeacher((x) => ({ ...x, designation: e.target.value }))} className="w-full px-4 py-3 rounded-xl border mb-5">
-              <option value="Teaching">Teaching</option>
-              <option value="TGT">TGT</option>
-              <option value="PGT">PGT</option>
-              <option value="Exam Department">Exam Department</option>
-            </select>
-
-            <label className="block text-sm font-semibold mb-2">Classes Handled</label>
-            <input type="number" min="0" value={newTeacher.classesHandled} onChange={(e) => setNewTeacher((x) => ({ ...x, classesHandled: e.target.value }))} className="w-full px-4 py-3 rounded-xl border mb-5" />
-
-            <label className="flex items-center gap-3 mb-4 text-sm font-semibold">
-              <input type="checkbox" checked={newTeacher.available} onChange={(e) => setNewTeacher((x) => ({ ...x, available: e.target.checked }))} />
-              Available
-            </label>
-
-            <label className="flex items-center gap-3 mb-6 text-sm font-semibold">
-              <input type="checkbox" checked={newTeacher.isExamHead} onChange={(e) => setNewTeacher((x) => ({ ...x, isExamHead: e.target.checked }))} />
-              Head of Exam Department
-            </label>
+            <label className="block text-sm font-semibold mb-2">Preferred Duty Range</label>
+            <div className="flex items-center gap-2 mb-5">
+              <input
+                type="number"
+                min="0"
+                step="1"
+                value={newTeacher.minDuties}
+                onChange={(e) => setNewTeacher((x) => ({ ...x, minDuties: e.target.value }))}
+                placeholder="Minimum"
+                className="w-full px-4 py-3 rounded-xl border"
+              />
+              <span className="text-slate-400 font-semibold">to</span>
+              <input
+                type="number"
+                min="0"
+                step="1"
+                value={newTeacher.maxDuties}
+                onChange={(e) => setNewTeacher((x) => ({ ...x, maxDuties: e.target.value }))}
+                placeholder="Maximum"
+                className="w-full px-4 py-3 rounded-xl border"
+              />
+            </div>
 
             <div className="flex justify-end gap-3">
               <button onClick={() => setShowAdd(false)} className="px-5 py-3 rounded-xl border">Cancel</button>
@@ -937,11 +1863,149 @@ function Invigilators() {
 
       <style>{`
         @media print {
-          @page { size: A4 landscape; margin: 10mm; }
-          body { background: white !important; }
-          .print\\:hidden { display: none !important; }
-          .print\\:break-inside-avoid { break-inside: avoid; }
-          .print\\:break-before-page { break-before: page; }
+          @page { size: A4 landscape; margin: 7mm; }
+
+          html, body {
+            width: 100% !important;
+            min-width: 0 !important;
+            background: white !important;
+            margin: 0 !important;
+            padding: 0 !important;
+          }
+
+          /* Print ONLY the generated duty report. */
+          body * {
+            visibility: hidden !important;
+          }
+
+          #printable-duty-report,
+          #printable-duty-report * {
+            visibility: visible !important;
+          }
+
+          #printable-duty-report {
+            position: absolute !important;
+            left: 0 !important;
+            top: 0 !important;
+            width: 100% !important;
+            margin: 0 !important;
+            padding: 0 !important;
+          }
+
+          #printable-duty-report .print\:hidden {
+            display: none !important;
+          }
+
+          /* Compact report header */
+          #printable-duty-report > div:first-child {
+            border: 0 !important;
+            box-shadow: none !important;
+            border-radius: 0 !important;
+            padding: 0 0 4mm 0 !important;
+            margin: 0 0 4mm 0 !important;
+          }
+
+          #printable-duty-report > div:first-child h2 {
+            font-size: 18pt !important;
+            line-height: 1.05 !important;
+            margin: 0 !important;
+          }
+
+          #printable-duty-report > div:first-child p {
+            font-size: 8.5pt !important;
+            margin-top: 2mm !important;
+          }
+
+          #printable-duty-report > div:first-child .grid {
+            display: flex !important;
+            gap: 8mm !important;
+            margin-top: 3mm !important;
+          }
+
+          #printable-duty-report > div:first-child .grid > div {
+            font-size: 8pt !important;
+          }
+
+          #printable-duty-report > div:first-child .grid .text-2xl {
+            font-size: 12pt !important;
+            line-height: 1 !important;
+          }
+
+          /* Compact exam-day blocks */
+          #printable-duty-report .print\:break-inside-avoid {
+            break-inside: avoid !important;
+            page-break-inside: avoid !important;
+          }
+
+          #printable-duty-report > div:not(:first-child) {
+            margin-bottom: 4mm !important;
+          }
+
+          #printable-duty-report > div:not(:first-child) > div:first-child {
+            padding: 2.5mm 3.5mm !important;
+          }
+
+          #printable-duty-report > div:not(:first-child) > div:first-child h3 {
+            font-size: 11pt !important;
+            line-height: 1 !important;
+          }
+
+          #printable-duty-report table {
+            width: 100% !important;
+            table-layout: fixed !important;
+            border-collapse: collapse !important;
+            font-size: 7.2pt !important;
+          }
+
+          #printable-duty-report th,
+          #printable-duty-report td {
+            padding: 1.7mm 2mm !important;
+            line-height: 1.15 !important;
+            vertical-align: middle !important;
+          }
+
+          #printable-duty-report th {
+            font-size: 7pt !important;
+            font-weight: 700 !important;
+          }
+
+          /* A4 landscape column sizing */
+          #printable-duty-report td:nth-child(1),
+          #printable-duty-report th:nth-child(1) { width: 8%; }
+          #printable-duty-report td:nth-child(2),
+          #printable-duty-report th:nth-child(2) { width: 9%; }
+          #printable-duty-report td:nth-child(3),
+          #printable-duty-report th:nth-child(3) { width: 21%; }
+          #printable-duty-report td:nth-child(4),
+          #printable-duty-report th:nth-child(4) { width: 7%; }
+          #printable-duty-report td:nth-child(5),
+          #printable-duty-report th:nth-child(5),
+          #printable-duty-report td:nth-child(6),
+          #printable-duty-report th:nth-child(6),
+          #printable-duty-report td:nth-child(7),
+          #printable-duty-report th:nth-child(7),
+          #printable-duty-report td:nth-child(8),
+          #printable-duty-report th:nth-child(8) { width: 13.75%; }
+
+          #printable-duty-report .overflow-x-auto {
+            overflow: visible !important;
+          }
+
+          #printable-duty-report .print\:break-before-page {
+            break-before: auto !important;
+            page-break-before: auto !important;
+            margin-top: 4mm !important;
+          }
+
+          /* Repeat headers when a table continues onto another page. */
+          #printable-duty-report thead {
+            display: table-header-group !important;
+          }
+
+          #printable-duty-report tr {
+            break-inside: avoid !important;
+            page-break-inside: avoid !important;
+          }
         }
       `}</style>
     </div>

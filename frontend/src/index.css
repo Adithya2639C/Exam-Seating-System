@@ -1,1 +1,116 @@
 @import "tailwindcss";
+
+/* =========================================================
+   SETTINGS / THEME SUPPORT
+   Add this at the END of src/index.css
+   ========================================================= */
+
+html[data-theme="dark"] {
+  background: #0f172a;
+}
+
+html[data-theme="dark"] body {
+  background: #0f172a;
+  color: #e2e8f0;
+}
+
+html[data-theme="dark"] .app-shell,
+html[data-theme="dark"] .dark-page {
+  background: #0f172a !important;
+}
+
+html[data-theme="dark"] .dark-header {
+  background: #111827 !important;
+  border-color: #334155 !important;
+}
+
+html[data-theme="dark"] .dark-card,
+html[data-theme="dark"] .dark-card.bg-white,
+html[data-theme="dark"] .bg-white.dark-card {
+  background: #1e293b !important;
+  border-color: #334155 !important;
+}
+
+html[data-theme="dark"] .dark-text {
+  color: #f8fafc !important;
+}
+
+html[data-theme="dark"] .dark-muted {
+  color: #94a3b8 !important;
+}
+
+/* Common Tailwind surfaces used throughout the app */
+html[data-theme="dark"] .bg-slate-50 {
+  background-color: #0f172a !important;
+}
+
+html[data-theme="dark"] .bg-slate-100 {
+  background-color: #111827 !important;
+}
+
+html[data-theme="dark"] .text-slate-900 {
+  color: #f8fafc !important;
+}
+
+html[data-theme="dark"] .text-slate-800 {
+  color: #e2e8f0 !important;
+}
+
+html[data-theme="dark"] .text-slate-700 {
+  color: #cbd5e1 !important;
+}
+
+html[data-theme="dark"] .text-slate-600 {
+  color: #cbd5e1 !important;
+}
+
+html[data-theme="dark"] .text-slate-500 {
+  color: #94a3b8 !important;
+}
+
+html[data-theme="dark"] .text-slate-400 {
+  color: #64748b !important;
+}
+
+html[data-theme="dark"] .border-slate-200 {
+  border-color: #334155 !important;
+}
+
+html[data-theme="dark"] .border-slate-300 {
+  border-color: #475569 !important;
+}
+
+html[data-theme="dark"] input,
+html[data-theme="dark"] select,
+html[data-theme="dark"] textarea {
+  background-color: #0f172a !important;
+  color: #f8fafc !important;
+  border-color: #475569 !important;
+}
+
+html[data-theme="dark"] option {
+  background-color: #0f172a;
+  color: #f8fafc;
+}
+
+/* Sidebar hover/secondary areas */
+html[data-theme="dark"] .hover\:bg-slate-100:hover {
+  background-color: #1e293b !important;
+}
+
+html[data-theme="dark"] .hover\:bg-slate-50:hover {
+  background-color: #1e293b !important;
+}
+
+/* Keep selected blue controls readable */
+html[data-theme="dark"] .bg-blue-50 {
+  background-color: #172554 !important;
+}
+
+html[data-theme="dark"] .text-blue-600 {
+  color: #60a5fa !important;
+}
+
+html[data-theme="dark"] .text-blue-700 {
+  color: #93c5fd !important;
+}
