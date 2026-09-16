@@ -946,10 +946,9 @@ function fillBench(
     recentClasses.add(getClassNumber(selectedClass))
   }
 
-  // Second priority: if the bench still has empty positions, only use a
-  // repeated overall class when it can be physically separated.
-  // For 3 seats this permits A | B | A, never A | A | B.
-  // For 4+ seats, the same class can repeat only in non-adjacent positions.
+  // Second priority: fill any remaining positions ONLY with a student
+  // whose overall class is not already present anywhere on this bench.
+  // The rule is bench-wide, not merely adjacent-seat based.
   for (const position of positions) {
     if (position.student) continue
 
@@ -958,59 +957,22 @@ function fillBench(
         const student = getNextStudent(pools, pointers, classKey)
         if (!student) return false
 
-        const immediateLeft = positions.find(
-          (item) => item.position === position.position - 1
-        )
-        const immediateRight = positions.find(
-          (item) => item.position === position.position + 1
-        )
-
-        if (
-          (immediateLeft?.student &&
-            !canSitOnBench(
-              student,
-              [immediateLeft.student],
-              restrictions
-            )) ||
-          (immediateRight?.student &&
-            !canSitOnBench(
-              student,
-              [immediateRight.student],
-              restrictions
-            ))
-        ) {
+        // No overall class may appear twice on the same bench.
+        if (benchStudents.some((other) => sameClass(student, other))) {
           return false
         }
 
-        const existingPositions = positions.filter(
-          (item) =>
-            item.student &&
-            sameClass(item.student, student)
-        )
-
-        // A repeated class on a 3-seat bench must be at the two ends.
-        if (capacity === 3 && existingPositions.length > 0) {
-          const existing = existingPositions[0].position
-          const oppositeEnd =
-            existing === 0
-              ? 2
-              : existing === 2
-              ? 0
-              : null
-
-          if (oppositeEnd === null) return false
-          if (position.position !== oppositeEnd) return false
-
-          const middle = positions.find(
-            (item) => item.position === 1
+        // Existing class-pair restrictions remain hard constraints.
+        if (
+          benchStudents.some((other) =>
+            areClassesRestricted(
+              student.classKey,
+              other.classKey,
+              restrictions
+            )
           )
-
-          if (
-            !middle?.student ||
-            sameClass(middle.student, student)
-          ) {
-            return false
-          }
+        ) {
+          return false
         }
 
         return true
@@ -1020,19 +982,28 @@ function fillBench(
     if (candidates.length === 0) continue
 
     candidates.sort((a, b) => {
-      const studentA = getNextStudent(pools, pointers, a)
-      const studentB = getNextStudent(pools, pointers, b)
+      const scoreA = scoreClassChoice({
+        classKey: a,
+        pools,
+        pointers,
+        benchStudents,
+        previousClassKeys: null,
+        recentClasses,
+        restrictions,
+      })
 
-      const repeatsA = benchStudents.filter((s) =>
-        sameClass(s, studentA)
-      ).length
-      const repeatsB = benchStudents.filter((s) =>
-        sameClass(s, studentB)
-      ).length
+      const scoreB = scoreClassChoice({
+        classKey: b,
+        pools,
+        pointers,
+        benchStudents,
+        previousClassKeys: null,
+        recentClasses,
+        restrictions,
+      })
 
-      if (repeatsA !== repeatsB) return repeatsA - repeatsB
-
-      return a.localeCompare(b, undefined, { numeric: true })
+      if (scoreA !== scoreB) return scoreB - scoreA
+      return Math.random() - 0.5
     })
 
     const selectedClass = candidates[0]
@@ -1161,8 +1132,8 @@ function validateSeatingPlan(seatingPlan, restrictions = []) {
   const errors = []
   const seenStudents = new Set()
 
-  seatingPlan.benches.forEach((bench) => {
-    const occupied = bench.positions.filter(
+  ;(seatingPlan?.benches || []).forEach((bench) => {
+    const occupied = (bench.positions || []).filter(
       (position) => position.student
     )
 
@@ -1182,54 +1153,32 @@ function validateSeatingPlan(seatingPlan, restrictions = []) {
       seenStudents.add(studentId)
     })
 
-    // Hard restriction: horizontally adjacent students on the same bench
-    // cannot belong to the same overall class or a restricted class pair.
-    for (let i = 0; i < bench.positions.length - 1; i++) {
-      const left = bench.positions[i].student
-      const right = bench.positions[i + 1].student
+    // HARD RULE:
+    // A bench may contain students from different sections of the same
+    // overall class only if they are NOT on the same bench. Therefore,
+    // every occupied position on one bench must have a unique overall class.
+    for (let i = 0; i < benchStudents.length; i++) {
+      for (let j = i + 1; j < benchStudents.length; j++) {
+        const first = benchStudents[i]
+        const second = benchStudents[j]
 
-      if (!left || !right) continue
-
-      if (
-        sameClass(left, right) ||
-        areClassesRestricted(
-          left.classKey,
-          right.classKey,
-          restrictions
-        )
-      ) {
-        errors.push(
-          `Unsafe adjacent students on bench ${bench.id || bench.name || ""}.`
-        )
-      }
-    }
-
-    // Three-seat rule: if a class repeats, it may only occupy both ends,
-    // with a different overall class in the middle.
-    if (bench.positions.length === 3) {
-      const a = bench.positions[0].student
-      const b = bench.positions[1].student
-      const c = bench.positions[2].student
-
-      if (a && b && c && sameClass(a, c)) {
-        if (sameClass(a, b)) {
+        if (sameClass(first, second)) {
           errors.push(
-            `Three students of the same overall class occupy bench ${bench.id || bench.name || ""}.`
+            `Same overall class appears more than once on bench ${bench.id || bench.name || ""}.`
           )
         }
-      }
 
-      const counts = {}
-      ;[a, b, c].forEach((student) => {
-        if (!student) return
-        const classNumber = getClassNumber(student.classKey)
-        counts[classNumber] = (counts[classNumber] || 0) + 1
-      })
-
-      if (Object.values(counts).some((count) => count === 3)) {
-        errors.push(
-          `All three seats on bench ${bench.id || bench.name || ""} are from the same overall class.`
-        )
+        if (
+          areClassesRestricted(
+            first.classKey,
+            second.classKey,
+            restrictions
+          )
+        ) {
+          errors.push(
+            `Restricted classes are seated on the same bench ${bench.id || bench.name || ""}.`
+          )
+        }
       }
     }
   })
@@ -1586,9 +1535,8 @@ function generateSeatingForRoom(
 //
 // Goals:
 // 1. Never leave the same overall class directly together on a bench.
-// 2. For a 3-seat bench, prefer A | B | A when there are enough
-//    students available. This uses the empty end seat instead of
-//    leaving A in the middle and B on one end.
+// 2. Never place the same overall class twice on the same bench,
+ //    including opposite ends of a 3-seat bench.
 // 3. Repair a 2-seat bench such as A | A by replacing one student
 //    with an available student from another overall class.
 // 4. After repairs, fill remaining safe empty seats.
@@ -1661,128 +1609,65 @@ function optimizeSmallRoomPlan(
   )
 
   // ----------------------------------------------------------
-  // PASS 1: Fix 3-seat benches.
+  // PASS 1: Enforce the new bench-wide class rule.
   //
-  // Example:
-  //     11A | 9C | EMPTY
+  // Every occupied seat on one bench must belong to a different
+  // overall class. Sections are ignored for this comparison:
+  // 12A, 12B and 12C are all overall Class 12.
   //
-  // If another 9C is unassigned, convert to:
-  //      9C | 11A | 9C
-  //
-  // This is exactly the "exchange positions + use the empty seat"
-  // optimization requested.
+  // If a duplicate class is found, first try to replace that student
+  // with a safe unassigned student. If no safe replacement exists,
+  // move the duplicate student to Unassigned rather than violating
+  // the hard rule.
   // ----------------------------------------------------------
   benches.forEach((bench) => {
-    if (bench.positions.length !== 3) return
+    for (let positionIndex = 0; positionIndex < bench.positions.length; positionIndex++) {
+      const position = bench.positions[positionIndex]
+      if (!position.student) continue
 
-    const positions = bench.positions
-    const a = positions[0]?.student || null
-    const b = positions[1]?.student || null
-    const c = positions[2]?.student || null
+      const otherStudents = bench.positions
+        .filter((item, index) => index !== positionIndex && item.student)
+        .map((item) => item.student)
 
-    // Pattern: A | B | EMPTY
-    if (a && b && !c && !sameClass(a, b)) {
-      const candidateIndex = unassignedStudents.findIndex(
-        (student) =>
-          sameClass(student, a) &&
-          canStudentOccupyPosition(
-            student,
-            [
-              { ...positions[0], student: null },
-              { ...positions[1], student: b },
-              { ...positions[2], student: a },
-            ],
-            0,
-            restrictions
-          )
+      const duplicateClass = otherStudents.some((other) =>
+        sameClass(position.student, other)
       )
 
-      if (candidateIndex !== -1) {
-        const newA = unassignedStudents[candidateIndex]
+      if (!duplicateClass) continue
 
-        positions[0].student = newA
-        positions[1].student = b
-        positions[2].student = a
-
-        unassignedStudents.splice(candidateIndex, 1)
-        return
-      }
-    }
-
-    // Pattern: EMPTY | B | A
-    if (!a && b && c && !sameClass(b, c)) {
-      const candidateIndex = unassignedStudents.findIndex(
-        (student) =>
-          sameClass(student, c) &&
-          canStudentOccupyPosition(
-            student,
-            [
-              { ...positions[0], student: c },
-              { ...positions[1], student: b },
-              { ...positions[2], student: null },
-            ],
-            2,
-            restrictions
-          )
-      )
-
-      if (candidateIndex !== -1) {
-        const newC = unassignedStudents[candidateIndex]
-
-        positions[0].student = c
-        positions[1].student = b
-        positions[2].student = newC
-
-        unassignedStudents.splice(candidateIndex, 1)
-      }
-    }
-  })
-
-  // ----------------------------------------------------------
-  // PASS 2: Repair unsafe 2-seat benches.
-  //
-  // Example:
-  //     11A | 11A
-  //
-  // Replace one position with an unassigned student from a
-  // different overall class.
-  // ----------------------------------------------------------
-  benches.forEach((bench) => {
-    if (bench.positions.length !== 2) return
-
-    const left = bench.positions[0]?.student || null
-    const right = bench.positions[1]?.student || null
-
-    if (!left || !right) return
-    if (!sameClass(left, right)) return
-
-    const replacementIndex = unassignedStudents.findIndex(
-      (student) =>
-        !sameClass(student, left) &&
-        !areClassesRestricted(
-          student.classKey,
-          left.classKey,
+      const replacementIndex = unassignedStudents.findIndex((candidate) =>
+        canStudentOccupyPosition(
+          candidate,
+          bench.positions,
+          positionIndex,
           restrictions
+        ) &&
+        !bench.positions.some(
+          (item, index) =>
+            index !== positionIndex &&
+            item.student &&
+            sameClass(candidate, item.student)
         )
-    )
+      )
 
-    if (replacementIndex === -1) return
-
-    const replacement = unassignedStudents[replacementIndex]
-
-    // Replace the later seat. The displaced student becomes
-    // available again for another empty seat.
-    bench.positions[1].student = replacement
-
-    unassignedStudents.splice(
-      replacementIndex,
-      1,
-      right
-    )
+      if (replacementIndex !== -1) {
+        const displaced = position.student
+        position.student = unassignedStudents[replacementIndex]
+        unassignedStudents.splice(
+          replacementIndex,
+          1,
+          displaced
+        )
+      } else {
+        const displaced = position.student
+        position.student = null
+        unassignedStudents.push(displaced)
+      }
+    }
   })
 
   // ----------------------------------------------------------
-  // PASS 3: Fill empty positions safely.
+  // PASS 2: Fill empty positions safely.
   // ----------------------------------------------------------
   let madeProgress = true
 
@@ -1802,33 +1687,21 @@ function optimizeSmallRoomPlan(
 
         if (position.student) continue
 
-        // For a 3-seat bench, if both ends already contain the
-        // same class with a different middle, it is already optimal.
-        if (
-          bench.positions.length === 3 &&
-          positionIndex === 1
-        ) {
-          const left = bench.positions[0]?.student
-          const right = bench.positions[2]?.student
-
-          if (
-            left &&
-            right &&
-            sameClass(left, right)
-          ) {
-            continue
-          }
-        }
-
         const candidateIndex =
-          unassignedStudents.findIndex((student) => {
-            return canStudentOccupyPosition(
+          unassignedStudents.findIndex((student) =>
+            canStudentOccupyPosition(
               student,
               bench.positions,
               positionIndex,
               restrictions
+            ) &&
+            !bench.positions.some(
+              (item, index) =>
+                index !== positionIndex &&
+                item.student &&
+                sameClass(student, item.student)
             )
-          })
+          )
 
         if (candidateIndex === -1) continue
 
@@ -1846,44 +1719,58 @@ function optimizeSmallRoomPlan(
   }
 
   // ----------------------------------------------------------
-  // PASS 4: Final hard-safety repair.
+  // PASS 3: Final hard-safety check.
   //
-  // This catches any accidental adjacent same-class seats.
+  // This verifies the entire bench, not only adjacent positions.
+  // Any remaining duplicate overall class or restricted pair is
+  // removed to Unassigned if it cannot be safely replaced.
   // ----------------------------------------------------------
   benches.forEach((bench) => {
-    for (
-      let i = 0;
-      i < bench.positions.length - 1;
-      i++
-    ) {
-      const left = bench.positions[i]?.student
-      const right = bench.positions[i + 1]?.student
+    for (let i = 0; i < bench.positions.length; i++) {
+      const student = bench.positions[i]?.student
+      if (!student) continue
 
-      if (!left || !right) continue
+      let unsafe = false
 
-      const unsafe =
-        sameClass(left, right) ||
-        areClassesRestricted(
-          left.classKey,
-          right.classKey,
-          restrictions
-        )
+      for (let j = 0; j < bench.positions.length; j++) {
+        if (i === j) continue
+
+        const other = bench.positions[j]?.student
+        if (!other) continue
+
+        if (
+          sameClass(student, other) ||
+          areClassesRestricted(
+            student.classKey,
+            other.classKey,
+            restrictions
+          )
+        ) {
+          unsafe = true
+          break
+        }
+      }
 
       if (!unsafe) continue
 
-      const replacementIndex =
-        unassignedStudents.findIndex((student) => {
-          return canStudentOccupyPosition(
-            student,
-            bench.positions,
-            i + 1,
-            restrictions
-          )
-        })
+      const replacementIndex = unassignedStudents.findIndex((candidate) =>
+        canStudentOccupyPosition(
+          candidate,
+          bench.positions,
+          i,
+          restrictions
+        ) &&
+        !bench.positions.some(
+          (item, index) =>
+            index !== i &&
+            item.student &&
+            sameClass(candidate, item.student)
+        )
+      )
 
       if (replacementIndex !== -1) {
-        const displaced = right
-        bench.positions[i + 1].student =
+        const displaced = bench.positions[i].student
+        bench.positions[i].student =
           unassignedStudents[replacementIndex]
 
         unassignedStudents.splice(
@@ -1892,11 +1779,9 @@ function optimizeSmallRoomPlan(
           displaced
         )
       } else {
-        // No safe replacement available, so keep the student
-        // unassigned rather than intentionally creating an unsafe
-        // arrangement.
-        bench.positions[i + 1].student = null
-        unassignedStudents.push(right)
+        const displaced = bench.positions[i].student
+        bench.positions[i].student = null
+        unassignedStudents.push(displaced)
       }
     }
   })
@@ -2185,6 +2070,487 @@ function calculateRoomTargets(rooms, totalStudents) {
   }
 
   return targets
+}
+
+// ============================================================
+// FLEXIBLE 3-5 CLASS ROOM HELPERS
+// ============================================================
+
+function getStudentOverallClassKey(student) {
+  const classNumber =
+    getClassNumber(student?.classKey) ??
+    getClassNumber(student?.classNumber)
+
+  return classNumber !== null
+    ? String(classNumber)
+    : String(
+        student?.classKey ||
+        student?.classNumber ||
+        "unknown"
+      )
+}
+
+function getStudentSectionKey(student) {
+  if (!student) return "unknown"
+
+  const overallClass = getStudentOverallClassKey(student)
+  const section = String(student.section || "").trim()
+
+  if (section) {
+    return `${overallClass}${section}`
+  }
+
+  if (student.classKey) {
+    return String(student.classKey)
+  }
+
+  return `${overallClass}-UNKNOWN-SECTION`
+}
+
+function groupStudentsByOverallClass(students) {
+  const groups = new Map()
+
+  ;[...(students || [])].forEach((student) => {
+    const overallClassKey = getStudentOverallClassKey(student)
+
+    if (!groups.has(overallClassKey)) {
+      groups.set(overallClassKey, [])
+    }
+
+    groups.get(overallClassKey).push(student)
+  })
+
+  return groups
+}
+
+function groupStudentsBySection(students) {
+  const groups = new Map()
+
+  ;[...(students || [])].forEach((student) => {
+    const sectionKey = getStudentSectionKey(student)
+
+    if (!groups.has(sectionKey)) {
+      groups.set(sectionKey, [])
+    }
+
+    groups.get(sectionKey).push(student)
+  })
+
+  return groups
+}
+
+// ------------------------------------------------------------
+// CHOOSE THE NUMBER OF OVERALL CLASSES FOR A ROOM
+// ------------------------------------------------------------
+// A normal room contains 3, 4 or 5 DIFFERENT overall classes.
+// Sections of the same overall class never increase this count.
+// Every participating overall class must still have at least 5 students.
+function getRoomClassCount(eligibleClassCount, roomTarget, minClasses = 3, maxClasses = 5) {
+  const target = Math.max(0, Number(roomTarget) || 0)
+
+  if (eligibleClassCount <= 0 || target < 5) return 0
+
+  const capacityBasedCount = Math.floor(target / 5)
+
+  const maximumAllowed = Math.min(
+    maxClasses,
+    eligibleClassCount,
+    capacityBasedCount
+  )
+
+  if (maximumAllowed < minClasses) {
+    // This is only an edge-case for a room whose target is too small to
+    // accommodate 3 classes with the 5-student minimum.
+    // Never create a 1/2/3/4-student class group just to force 3 classes.
+    return maximumAllowed
+  }
+
+  // Use as many suitable overall classes as possible, up to 5.
+  return maximumAllowed
+}
+
+function getBalancedQuotas(classKeys, totalStudents) {
+  const keys = [...(classKeys || [])]
+  const target = Math.max(0, Number(totalStudents) || 0)
+
+  if (keys.length === 0 || target <= 0) return {}
+
+  const base = Math.floor(target / keys.length)
+  let extras = target % keys.length
+
+  const quotas = {}
+
+  // Deterministic order keeps room generation predictable.
+  // Extra students are then given to the first classes in this order.
+  keys.forEach((key) => {
+    quotas[key] = base
+  })
+
+  for (const key of keys) {
+    if (extras <= 0) break
+    quotas[key] += 1
+    extras -= 1
+  }
+
+  return quotas
+}
+
+// ------------------------------------------------------------
+// CHOOSE ONE SECTION FOR ONE OVERALL CLASS
+// ------------------------------------------------------------
+// This is the important rule requested by the user:
+//
+//   Class 9A + 9B + 9C = ONE overall class 9.
+//   But a particular room must use only ONE section of class 9.
+//
+// The section is selected to fit that room's quota as closely as possible.
+// Exact match is preferred. If no exact match exists, prefer a section that
+// has enough students to fill the quota. Among those, choose the smallest
+// surplus. If no section can fill the quota, use the largest available
+// section (still requiring at least 5 students).
+function chooseBestSectionForQuota(classStudents, quota) {
+  const sectionGroups = groupStudentsBySection(classStudents)
+
+  const eligibleSections = Array.from(sectionGroups.entries())
+    .map(([sectionKey, sectionStudents]) => ({
+      sectionKey,
+      students: sectionStudents,
+      strength: sectionStudents.length,
+    }))
+    .filter((entry) => entry.strength >= 5)
+
+  if (eligibleSections.length === 0) {
+    return null
+  }
+
+  const target = Math.max(0, Number(quota) || 0)
+
+  eligibleSections.sort((a, b) => {
+    // 1. Exact quota match is always preferred.
+    const aExact = a.strength === target
+    const bExact = b.strength === target
+
+    if (aExact !== bExact) {
+      return aExact ? -1 : 1
+    }
+
+    // 2. Prefer sections that can actually supply the quota.
+    const aCanFill = a.strength >= target
+    const bCanFill = b.strength >= target
+
+    if (aCanFill !== bCanFill) {
+      return aCanFill ? -1 : 1
+    }
+
+    // 3. If both can fill, prefer the smallest surplus.
+    //    If neither can fill, prefer the smallest deficit / largest section.
+    if (aCanFill && bCanFill) {
+      const surplusA = a.strength - target
+      const surplusB = b.strength - target
+
+      if (surplusA !== surplusB) {
+        return surplusA - surplusB
+      }
+    } else {
+      if (a.strength !== b.strength) {
+        return b.strength - a.strength
+      }
+    }
+
+    // 4. Stable deterministic tie-break.
+    return String(a.sectionKey).localeCompare(
+      String(b.sectionKey),
+      undefined,
+      { numeric: true }
+    )
+  })
+
+  return eligibleSections[0]
+}
+
+// Score an overall class for room selection.
+// We prefer classes that have a SINGLE section capable of supplying the
+// room's balanced quota. This prevents a room from needing to split one
+// overall class across multiple sections.
+function scoreOverallClassForQuota(classStudents, quota) {
+  const bestSection = chooseBestSectionForQuota(
+    classStudents,
+    quota
+  )
+
+  if (!bestSection) {
+    return Number.NEGATIVE_INFINITY
+  }
+
+  const target = Math.max(0, Number(quota) || 0)
+  const strength = bestSection.strength
+
+  let score = 0
+
+  if (strength === target) {
+    score += 100000
+  } else if (strength > target) {
+    // A section that can completely fill the quota is strongly preferred.
+    score += 50000
+    score -= (strength - target) * 100
+  } else {
+    // Below quota is possible only when no section of this overall class
+    // can reach the requested quota.
+    score += 10000
+    score += strength * 10
+  }
+
+  // Prefer stronger overall classes as a soft tie-break.
+  score += Math.min(classStudents.length, 100)
+
+  return score
+}
+
+function selectRoomClasses(
+  students,
+  totalStudents,
+  minClasses = 3,
+  maxClasses = 5
+) {
+  const groups = groupStudentsByOverallClass(students)
+
+  // Only an OVERALL class with at least 5 students available can be used.
+  // Sections are combined only for checking the overall-class strength;
+  // they are NOT combined when students are actually selected for the room.
+  const eligibleEntries = Array.from(groups.entries())
+    .map(([classKey, classStudents]) => ({
+      classKey,
+      students: classStudents,
+      strength: classStudents.length,
+    }))
+    .filter((entry) => entry.strength >= 5)
+
+  if (eligibleEntries.length === 0) {
+    return {
+      classKeys: [],
+      students: [],
+    }
+  }
+
+  const roomTarget = Math.max(
+    0,
+    Number(totalStudents) || 0
+  )
+
+  const count = getRoomClassCount(
+    eligibleEntries.length,
+    roomTarget,
+    minClasses,
+    maxClasses
+  )
+
+  if (count <= 0) {
+    return {
+      classKeys: [],
+      students: [],
+    }
+  }
+
+  // Quota depends only on the NUMBER of overall classes in this room.
+  const provisionalClassKeys = eligibleEntries
+    .map((entry) => entry.classKey)
+    .sort((a, b) =>
+      String(a).localeCompare(
+        String(b),
+        undefined,
+        { numeric: true }
+      )
+    )
+
+  const provisionalKeys = provisionalClassKeys.slice(0, count)
+  const provisionalQuotas = getBalancedQuotas(
+    provisionalKeys,
+    roomTarget
+  )
+
+  // Score every overall class according to how well one of its sections can
+  // match the room's provisional balanced quota.
+  const scored = eligibleEntries
+    .map((entry) => ({
+      ...entry,
+      score: scoreOverallClassForQuota(
+        entry.students,
+        provisionalQuotas[entry.classKey] ?? Math.floor(roomTarget / count)
+      ),
+    }))
+    .sort((a, b) => {
+      if (b.score !== a.score) return b.score - a.score
+
+      if (b.strength !== a.strength) {
+        return b.strength - a.strength
+      }
+
+      return String(a.classKey).localeCompare(
+        String(b.classKey),
+        undefined,
+        { numeric: true }
+      )
+    })
+
+  const selected = scored.slice(0, count)
+
+  return {
+    classKeys: selected.map((entry) => entry.classKey),
+    students: selected.flatMap((entry) => entry.students),
+  }
+}
+
+// ============================================================
+// BALANCED CLASS DISTRIBUTION PER ROOM
+// ============================================================
+//
+// IMPORTANT:
+//   1. Sections are NOT different classes for SA.
+//   2. Each overall class gets an equal-as-possible quota.
+//   3. ONLY ONE SECTION of each overall class is selected in this room.
+//   4. The selected section is the one most suitable for that quota.
+//   5. A selected class must have at least 5 students available in that
+//      section. We never intentionally create 1/2/3/4-student groups.
+//
+// Examples:
+//   Room target 36 with 3 overall classes -> 12 / 12 / 12
+//   Room target 37 with 4 overall classes -> 9 / 9 / 9 / 10
+//   Room target 36 with 5 overall classes -> 7 / 7 / 7 / 7 / 8
+//
+// Suppose Class 9 has:
+//   9A = 6, 9B = 12, 9C = 15
+// and Class 9's room quota is 12.
+// The room uses ONLY 9B (12), not 9A + 9B + 9C.
+// ============================================================
+function getBalancedClassDistribution(
+  students,
+  totalStudents,
+  forcedClassKeys = null
+) {
+  const list = [...(students || [])]
+  const target = Math.min(
+    Math.max(Number(totalStudents) || 0, 0),
+    list.length
+  )
+
+  if (target <= 0 || list.length === 0) {
+    return {
+      students: [],
+      distribution: {},
+      sectionDistribution: {},
+    }
+  }
+
+  const overallGroups = groupStudentsByOverallClass(list)
+
+  let classKeys = Array.isArray(forcedClassKeys)
+    ? forcedClassKeys.filter((key) =>
+        overallGroups.has(String(key))
+      )
+    : Array.from(overallGroups.keys())
+        .filter((key) => overallGroups.get(key).length >= 5)
+        .sort((a, b) =>
+          String(a).localeCompare(
+            String(b),
+            undefined,
+            { numeric: true }
+          )
+        )
+
+  // Never use an overall class with fewer than 5 available students.
+  classKeys = classKeys.filter(
+    (key) => overallGroups.get(String(key)).length >= 5
+  )
+
+  if (classKeys.length === 0) {
+    return {
+      students: [],
+      distribution: {},
+      sectionDistribution: {},
+    }
+  }
+
+  // Keep the room at 3-5 overall classes where possible, while making sure
+  // each class can receive at least 5 students.
+  const feasibleCount = Math.min(
+    classKeys.length,
+    5,
+    Math.max(1, Math.floor(target / 5))
+  )
+
+  if (feasibleCount <= 0) {
+    return {
+      students: [],
+      distribution: {},
+      sectionDistribution: {},
+    }
+  }
+
+  classKeys = classKeys.slice(0, feasibleCount)
+
+  const distribution = getBalancedQuotas(
+    classKeys,
+    target
+  )
+
+  const selectedStudents = []
+  const finalDistribution = {}
+  const sectionDistribution = {}
+
+  classKeys.forEach((classKey) => {
+    const classStudents = overallGroups.get(String(classKey)) || []
+    const quota = distribution[classKey] || 0
+
+    // Select ONLY ONE section for this overall class in this room.
+    const bestSection = chooseBestSectionForQuota(
+      classStudents,
+      quota
+    )
+
+    if (!bestSection) {
+      return
+    }
+
+    // Never deliberately create a <5-student group.
+    if (bestSection.students.length < 5) {
+      return
+    }
+
+    const sectionStudents = [...bestSection.students].sort((a, b) => {
+      return (
+        Number(a.rollNumber ?? 0) -
+        Number(b.rollNumber ?? 0)
+      )
+    })
+
+    const takeCount = Math.min(
+      quota,
+      sectionStudents.length
+    )
+
+    if (takeCount < 5) {
+      return
+    }
+
+    const chosenStudents = sectionStudents.slice(
+      0,
+      takeCount
+    )
+
+    selectedStudents.push(...chosenStudents)
+    finalDistribution[classKey] = chosenStudents.length
+    sectionDistribution[classKey] = {
+      sectionKey: bestSection.sectionKey,
+      studentCount: chosenStudents.length,
+      availableInSection: bestSection.strength,
+    }
+  })
+
+  return {
+    students: selectedStudents,
+    distribution: finalDistribution,
+    sectionDistribution,
+  }
 }
 
 // ============================================================
@@ -4282,10 +4648,12 @@ function getStrictClassroomAdjacentSeats(result, targetSeat) {
         (Number(seat.x ?? 0) + seatIndex * 45)
     )
 
-    // Same physical 3-seat/2-seat bench.
+    // Same physical bench:
+    // EVERY other occupied seat on the same bench is a conflict candidate.
+    // This enforces the new rule for 2-seat and 3-seat benches alike.
     if (
       furnitureId === targetFurnitureId &&
-      Math.abs(seatIndex - targetIndex) === 1
+      seatIndex !== targetIndex
     ) {
       neighbours.push(seat)
       seen.add(seat.id)
@@ -4863,12 +5231,8 @@ function repairAllRemainingClassroomConflicts(
         selectedStudents.length
       )
 
-    // RANDOMIZED BUT REPORT-FRIENDLY INPUT ORDER
-    //
-    // Keep every class in one continuous roll-number block (01, 02,
-    // 03, ...), but randomize the ORDER OF THE CLASS BLOCKS.
-    // The actual seating algorithm still places students randomly among
-    // valid seats and continues to enforce every hard restriction.
+    // Keep each class in one continuous roll-number block, while each room
+    // chooses 3, 4 or 5 different overall classes.
     let remainingStudents =
       buildContinuousRandomStudentOrder(
         selectedStudents
@@ -4895,11 +5259,41 @@ function repairAllRemainingClassroomConflicts(
             room
           )
 
-        const roomStudents =
-          remainingStudents.slice(
-            0,
-            target
+        // Pick up to 5 DIFFERENT overall classes for this room.
+        // 12A and 12B are treated as the same overall class 12.
+        const roomClassSelection =
+          selectRoomClasses(
+            remainingStudents,
+            target,
+            3,
+            5
           )
+
+        const allowedClasses =
+          new Set(
+            roomClassSelection.classKeys
+          )
+
+        const roomCandidateStudents =
+          remainingStudents.filter((student) =>
+            allowedClasses.has(
+              getStudentOverallClassKey(student)
+            )
+          )
+
+        // Split this room's target as evenly as possible among its
+        // selected 3-5 OVERALL classes. Because room classes are selected
+        // only when they have at least 5 available students, this prevents
+        // tiny groups such as 1/2/3 from being created.
+        const balancedRoom =
+          getBalancedClassDistribution(
+            roomCandidateStudents,
+            target,
+            roomClassSelection.classKeys
+          )
+
+        const roomStudents =
+          balancedRoom.students
 
         const result =
           generateSeatingForRoom(
@@ -4908,19 +5302,6 @@ function repairAllRemainingClassroomConflicts(
             seatingRestrictions,
             room.type
           )
-
-        // ====================================================
-        // IMPORTANT FIX:
-        //
-        // Remove the exact students that were actually assigned.
-        //
-        // The previous code used:
-        //
-        // remainingStudents.slice(used)
-        //
-        // That was incorrect when the seating algorithm left a
-        // student unassigned in the middle of roomStudents.
-        // ====================================================
 
         const assignedIds =
           new Set(
@@ -4940,20 +5321,22 @@ function repairAllRemainingClassroomConflicts(
 
         results.push({
           room,
-
-          seats:
-            result.seats,
-
-          targetStudents:
-            target,
-
+          seats: result.seats,
+          targetStudents: target,
+          classDistribution:
+            balancedRoom.distribution,
+          classGroup:
+            roomClassSelection.classKeys,
+          overallClassGroup:
+            roomClassSelection.classKeys,
+          sectionDistribution:
+            balancedRoom.sectionDistribution || {},
           assignedStudents,
-
           remainingStudents:
             result.remainingStudents,
         })
 
-        // Remove only the students that were actually assigned.
+        // Remove only students actually assigned to this room.
         remainingStudents =
           remainingStudents.filter(
             (student) =>
@@ -5020,25 +5403,116 @@ function repairAllRemainingClassroomConflicts(
               break
             }
 
-            const studentIndex =
+            // Keep this room within its balanced class quota.
+            const classCounts = {}
+
+            result.seats.forEach((existingSeat) => {
+              if (!existingSeat.student) return
+
+              const classNumber =
+                getClassNumber(existingSeat.student.classKey) ??
+                getClassNumber(existingSeat.student.classNumber)
+
+              const classKey =
+                classNumber !== null
+                  ? String(classNumber)
+                  : String(
+                      existingSeat.student.classKey ||
+                      existingSeat.student.classNumber ||
+                      "unknown"
+                    )
+
+              classCounts[classKey] =
+                (classCounts[classKey] || 0) + 1
+            })
+
+            const quota = result.classDistribution || {}
+
+            const eligibleStudents = remainingStudents.filter((student) => {
+              const classNumber =
+                getClassNumber(student.classKey) ??
+                getClassNumber(student.classNumber)
+
+              const classKey =
+                classNumber !== null
+                  ? String(classNumber)
+                  : String(
+                      student.classKey ||
+                      student.classNumber ||
+                      "unknown"
+                    )
+
+              // Only the overall classes originally selected for this room
+              // are allowed. Sections of other overall classes are rejected.
+              if (
+                !Object.prototype.hasOwnProperty.call(
+                  quota,
+                  classKey
+                )
+              ) {
+                return false
+              }
+
+              // IMPORTANT: this room uses ONLY ONE SECTION of each overall
+              // class. Do not fill the remaining quota with another section
+              // of the same class.
+              const selectedSection =
+                result.sectionDistribution?.[classKey]?.sectionKey
+
+              if (selectedSection) {
+                if (
+                  getStudentSectionKey(student) !==
+                  selectedSection
+                ) {
+                  return false
+                }
+              }
+
+              // Also respect this room's balanced quota.
+              if (
+                (classCounts[classKey] || 0) >=
+                quota[classKey]
+              ) {
+                return false
+              }
+
+              return true
+            })
+
+            if (eligibleStudents.length === 0) {
+              continue
+            }
+
+            const compatibleIndex =
               findCompatibleStudentIndex(
-                remainingStudents,
+                eligibleStudents,
                 seat,
                 result.seats,
                 seatingRestrictions
               )
 
             if (
-              studentIndex ===
+              compatibleIndex ===
               -1
             ) {
               continue
             }
 
             const student =
-              remainingStudents[
-                studentIndex
+              eligibleStudents[
+                compatibleIndex
               ]
+
+            const studentIndex =
+              remainingStudents.findIndex(
+                (candidate) =>
+                  getStudentId(candidate) ===
+                  getStudentId(student)
+              )
+
+            if (studentIndex === -1) {
+              continue
+            }
 
             seat.student =
               student
