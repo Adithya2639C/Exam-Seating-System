@@ -4799,6 +4799,208 @@ function getTargetSeatGroup(result, startSeatId, count) {
 // COMPONENT
 // ============================================================
 
+
+// ============================================================
+// FINAL CONTINUOUS ROOM ALLOCATION NORMALIZER
+// ============================================================
+// The physical seating engine may occasionally leave a student out of a
+// room's original block when a safe seat cannot be found. That must NEVER
+// produce a report such as 9222-9223 and 9225-9236 in the same room.
+//
+// This final pass makes the physical room membership itself authoritative:
+//   - one section per overall class in a room
+//   - one contiguous roll run per class/section in that room
+//   - groups below the 5-student minimum are removed from that room
+//   - removed students return to the global recovery pool
+//
+// Physical seat order is not changed by this helper; only room membership is
+// cleaned. A later repack shuffles those kept students again.
+function splitStudentsIntoContiguousRuns(students) {
+  const sorted = [...(students || [])].sort(
+    (a, b) => Number(a?.rollNumber || 0) - Number(b?.rollNumber || 0)
+  )
+
+  const runs = []
+  let current = []
+
+  for (const student of sorted) {
+    if (!current.length) {
+      current = [student]
+      continue
+    }
+
+    const previous = current[current.length - 1]
+    const previousRoll = Number(previous?.rollNumber || 0)
+    const currentRoll = Number(student?.rollNumber || 0)
+
+    if (currentRoll === previousRoll + 1) {
+      current.push(student)
+    } else {
+      runs.push(current)
+      current = [student]
+    }
+  }
+
+  if (current.length) runs.push(current)
+  return runs
+}
+
+function rebuildRoomAllocationMetadata(result) {
+  const students = (result?.seats || [])
+    .filter((seat) => seat?.student)
+    .map((seat) => seat.student)
+
+  const classDistribution = {}
+  const sectionDistribution = {}
+  const classGroup = []
+  const overallClassGroup = []
+
+  students.forEach((student) => {
+    const classKey = getStudentOverallClassKey(student)
+    const sectionKey = getStudentSectionKey(student)
+
+    classDistribution[classKey] =
+      (classDistribution[classKey] || 0) + 1
+
+    if (!sectionDistribution[classKey]) {
+      sectionDistribution[classKey] = {
+        sectionKey,
+        studentCount: 0,
+        availableInSection: 0,
+      }
+    }
+
+    sectionDistribution[classKey].studentCount += 1
+    sectionDistribution[classKey].availableInSection += 1
+
+    if (!classGroup.includes(classKey)) classGroup.push(classKey)
+    if (!overallClassGroup.includes(classKey)) {
+      overallClassGroup.push(classKey)
+    }
+  })
+
+  result.classDistribution = classDistribution
+  result.sectionDistribution = sectionDistribution
+  result.classGroup = classGroup
+  result.overallClassGroup = overallClassGroup
+  result.allocatedStudents = [...students]
+  result.assignedStudents = students.length
+  result.remainingStudents = []
+}
+
+function normalizeRoomToContinuousAllocation(result) {
+  if (!result || !Array.isArray(result.seats)) return []
+
+  const classGroups = new Map()
+
+  result.seats.forEach((seat) => {
+    if (!seat?.student) return
+
+    const classKey = getStudentOverallClassKey(seat.student)
+    const sectionKey = getStudentSectionKey(seat.student)
+    const groupKey = `${classKey}::${sectionKey}`
+
+    if (!classGroups.has(groupKey)) {
+      classGroups.set(groupKey, [])
+    }
+
+    classGroups.get(groupKey).push({
+      seat,
+      student: seat.student,
+    })
+  })
+
+  const bestRunByClass = new Map()
+
+  classGroups.forEach((entries, groupKey) => {
+    const runs = splitStudentsIntoContiguousRuns(
+      entries.map((entry) => entry.student)
+    )
+
+    const entryByStudentId = new Map(
+      entries.map((entry) => [getStudentId(entry.student), entry])
+    )
+
+    const candidates = runs
+      .map((run) => ({
+        students: run,
+        entries: run
+          .map((student) => entryByStudentId.get(getStudentId(student)))
+          .filter(Boolean),
+        start: Number(run[0]?.rollNumber || 0),
+      }))
+      .sort((a, b) => {
+        if (b.students.length !== a.students.length) {
+          return b.students.length - a.students.length
+        }
+        return a.start - b.start
+      })
+
+    const classKey = getStudentOverallClassKey(entries[0]?.student)
+
+    const best = candidates.find((candidate) => candidate.students.length >= 5)
+
+    if (!best) {
+      // This class/section does not form a valid group in this room.
+      return
+    }
+
+    const current = bestRunByClass.get(classKey)
+
+    // One overall class may contribute only ONE section to this room.
+    // Prefer the section/run that preserves the largest valid contiguous block.
+    if (
+      !current ||
+      best.students.length > current.students.length ||
+      (
+        best.students.length === current.students.length &&
+        best.start < current.start
+      )
+    ) {
+      bestRunByClass.set(classKey, {
+        groupKey,
+        sectionKey: getStudentSectionKey(entries[0]?.student),
+        ...best,
+      })
+    }
+  })
+
+  const keepIds = new Set()
+
+  bestRunByClass.forEach((run) => {
+    run.students.forEach((student) => {
+      keepIds.add(getStudentId(student))
+    })
+  })
+
+  const released = []
+
+  result.seats.forEach((seat) => {
+    if (!seat?.student) return
+
+    const id = getStudentId(seat.student)
+
+    if (!keepIds.has(id)) {
+      released.push(seat.student)
+      seat.student = null
+    }
+  })
+
+  rebuildRoomAllocationMetadata(result)
+
+  return released
+}
+
+function normalizeAllRoomAllocationsToContinuousBlocks(results) {
+  const released = []
+
+  ;(results || []).forEach((result) => {
+    released.push(...normalizeRoomToContinuousAllocation(result))
+  })
+
+  return released
+}
+
 function SeatingArrangement({ onGoToReports }) {
   const savedSeatingState = useMemo(
     () => loadSavedSeatingState(),
@@ -7822,63 +8024,265 @@ function repairAllRemainingClassroomConflicts(
     }
 
     // ========================================================
-    // FINAL CONTINUOUS-ALLOCATION VALIDATION
+    // FINAL CONTINUOUS-ALLOCATION ENFORCEMENT
     // ========================================================
-    // The room allocation itself must be continuous. This is deliberately
-    // checked after every recovery/fill pass so the Reports page never has
-    // to invent or hide gaps.
-    results.forEach((result) => {
-      const groups = new Map()
+    // Do not merely warn about fragmented blocks. Normalize the actual room
+    // membership, return released students to the global pool, and retry them
+    // through the normal contiguous recovery path.
 
-      ;(result.seats || []).forEach((seat) => {
-        if (!seat?.student) return
-        const sectionKey = getStudentSectionKey(seat.student)
-        if (!groups.has(sectionKey)) groups.set(sectionKey, [])
-        groups.get(sectionKey).push(Number(seat.student.rollNumber || 0))
+    for (let allocationPass = 0; allocationPass < 3; allocationPass += 1) {
+      const beforeAssigned = results.reduce(
+        (sum, result) =>
+          sum +
+          (result?.seats || []).filter((seat) => seat?.student).length,
+        0
+      )
+
+      normalizeAllRoomAllocationsToContinuousBlocks(results)
+
+      // Rebuild the global recovery pool from the actual selected students.
+      // This automatically includes students released by the normalization
+      // and excludes students currently seated in any room.
+      const assignedIds = new Set(
+        results.flatMap((result) =>
+          (result?.seats || [])
+            .filter((seat) => seat?.student)
+            .map((seat) => getStudentId(seat.student))
+        )
+      )
+
+      remainingStudents = selectedStudents.filter(
+        (student) => !assignedIds.has(getStudentId(student))
+      )
+
+      // First extend existing contiguous room blocks.
+      remainingStudents =
+        recoverExistingRoomBlocksFromGlobalRemaining(
+          results,
+          remainingStudents,
+          seatingRestrictions
+        )
+
+      // Then use the Large Hall as the final contiguous reservoir.
+      remainingStudents =
+        recoverGlobalRemainingIntoLargeHall(
+          results,
+          remainingStudents,
+          seatingRestrictions
+        )
+
+      // Give small rooms another opportunity to consume contiguous Hall
+      // extensions before we finalize the report.
+      fillEmptySmallRoomSeatsFromLargeHall(
+        results,
+        seatingRestrictions
+      )
+
+      // Repack each room using exactly its current membership. This preserves
+      // room allocation while randomizing physical seats.
+      results.forEach((result) => {
+        const allocated = (result?.seats || [])
+          .filter((seat) => seat?.student)
+          .map((seat) => seat.student)
+
+        result.allocatedStudents = [...allocated]
+
+        const repacked = generateBestSeatingForRoom(
+          buildPhysicalSeats(result.room),
+          allocated,
+          seatingRestrictions,
+          result.room.type,
+          250
+        )
+
+        result.seats = repacked.seats
+        result.remainingStudents = repacked.remainingStudents || []
+        rebuildRoomAllocationMetadata(result)
       })
 
-      for (const [sectionKey, rolls] of groups.entries()) {
-        const sorted = rolls.filter((roll) => roll > 0).sort((a, b) => a - b)
-        for (let index = 1; index < sorted.length; index += 1) {
-          if (sorted[index] !== sorted[index - 1] + 1) {
-            console.warn(
-              `Continuous allocation warning: ${sectionKey} in ${result.room?.name || "room"} is fragmented.`,
-              sorted
-            )
-            break
-          }
-        }
-      }
-    })
+      repairSeatingConflictsInPlace(
+        results,
+        seatingRestrictions
+      )
+
+      const afterAssigned = results.reduce(
+        (sum, result) =>
+          sum +
+          (result?.seats || []).filter((seat) => seat?.student).length,
+        0
+      )
+
+      if (afterAssigned <= beforeAssigned) break
+    }
+
+    // ========================================================
+    // FINAL RECOVERY + CONTINUOUS NORMALIZATION LOOP
+    // ========================================================
+    // A final normalization can release students when a room has more than
+    // one physical run for the same overall class/section. Do NOT immediately
+    // call those students unassigned. Put them back into the global recovery
+    // pool and give the existing room blocks, Large Hall, and small-room Hall
+    // transfer logic another chance to place them as valid contiguous blocks.
+    // This is the main safeguard that reduces avoidable unassigned students
+    // while keeping Reports completely truthful.
+    for (let finalPass = 0; finalPass < 4; finalPass += 1) {
+      const beforeAssigned = results.reduce(
+        (sum, result) =>
+          sum +
+          (result?.seats || []).filter((seat) => seat?.student).length,
+        0
+      )
+
+      normalizeAllRoomAllocationsToContinuousBlocks(results)
+
+      const assignedIds = new Set(
+        results.flatMap((result) =>
+          (result?.seats || [])
+            .filter((seat) => seat?.student)
+            .map((seat) => getStudentId(seat.student))
+        )
+      )
+
+      remainingStudents = selectedStudents.filter(
+        (student) => !assignedIds.has(getStudentId(student))
+      )
+
+      // 1) Extend existing room blocks first. This can consume single
+      // adjacent rolls without changing a room's class mix.
+      remainingStudents =
+        recoverExistingRoomBlocksFromGlobalRemaining(
+          results,
+          remainingStudents,
+          seatingRestrictions
+        )
+
+      // 2) Put larger valid contiguous blocks into the Large Hall.
+      remainingStudents =
+        recoverGlobalRemainingIntoLargeHall(
+          results,
+          remainingStudents,
+          seatingRestrictions
+        )
+
+      // 3) Use remaining Hall students to fill spare Classroom/Lab seats.
+      fillEmptySmallRoomSeatsFromLargeHall(
+        results,
+        seatingRestrictions
+      )
+
+      // 4) Repack physical seats only; room membership remains fixed.
+      results.forEach((result) => {
+        const allocated = (result?.seats || [])
+          .filter((seat) => seat?.student)
+          .map((seat) => seat.student)
+
+        result.allocatedStudents = [...allocated]
+
+        const repacked = generateBestSeatingForRoom(
+          buildPhysicalSeats(result.room),
+          allocated,
+          seatingRestrictions,
+          result.room.type,
+          220
+        )
+
+        result.seats = repacked.seats
+        result.remainingStudents = repacked.remainingStudents || []
+        result.assignedStudents = (result.seats || []).filter(
+          (seat) => seat?.student
+        ).length
+      })
+
+      repairSeatingConflictsInPlace(
+        results,
+        seatingRestrictions
+      )
+
+      const afterAssigned = results.reduce(
+        (sum, result) =>
+          sum +
+          (result?.seats || []).filter((seat) => seat?.student).length,
+        0
+      )
+
+      // No gain: another pass would just repeat the same state.
+      if (afterAssigned <= beforeAssigned) break
+    }
+
+    // Final authoritative normalization. At this point it is followed by a
+    // small recovery pass as well, so students released by this normalization
+    // are not silently lost from the arrangement.
+    normalizeAllRoomAllocationsToContinuousBlocks(results)
+
+    const postNormalizeAssignedIds = new Set(
+      results.flatMap((result) =>
+        (result?.seats || [])
+          .filter((seat) => seat?.student)
+          .map((seat) => getStudentId(seat.student))
+      )
+    )
+
+    let postNormalizeRemaining = selectedStudents.filter(
+      (student) => !postNormalizeAssignedIds.has(getStudentId(student))
+    )
+
+    if (postNormalizeRemaining.length > 0) {
+      postNormalizeRemaining =
+        recoverExistingRoomBlocksFromGlobalRemaining(
+          results,
+          postNormalizeRemaining,
+          seatingRestrictions
+        )
+
+      postNormalizeRemaining =
+        recoverGlobalRemainingIntoLargeHall(
+          results,
+          postNormalizeRemaining,
+          seatingRestrictions
+        )
+
+      fillEmptySmallRoomSeatsFromLargeHall(
+        results,
+        seatingRestrictions
+      )
+
+      // Re-normalize once after these last recoveries so the report remains
+      // guaranteed contiguous.
+      normalizeAllRoomAllocationsToContinuousBlocks(results)
+    }
+
+    const finalAssignedIds = new Set(
+      results.flatMap((result) =>
+        (result?.seats || [])
+          .filter((seat) => seat?.student)
+          .map((seat) => getStudentId(seat.student))
+      )
+    )
+
+    remainingStudents = selectedStudents.filter(
+      (student) => !finalAssignedIds.has(getStudentId(student))
+    )
 
     // ========================================================
     // FINAL UNASSIGNED
     // ========================================================
-    // Global remainingStudents are students that were never allocated to a
-    // room at all. Room-specific leftovers remain on their original room so
-    // the same continuous roll block can still be retried there.
-    const finalRoomUnassigned = results.flatMap(
-      (result) => result.remainingStudents || []
-    )
-
-    const finalUnassigned = [
-      ...remainingStudents,
-      ...finalRoomUnassigned,
-    ]
+    // Only students that are genuinely absent from every room are unassigned.
+    // Room-specific leftovers are already represented by the global pool.
 
     const finalUnique = []
     const finalIds = new Set()
 
-    finalUnassigned.forEach((student) => {
+    remainingStudents.forEach((student) => {
       const id = getStudentId(student)
       if (finalIds.has(id)) return
       finalIds.add(id)
       finalUnique.push(student)
     })
 
-    if (results.length > 0) {
-      results[results.length - 1].remainingStudents = finalUnique
-    }
+    results.forEach((result) => {
+      result.remainingStudents = []
+      rebuildRoomAllocationMetadata(result)
+    })
 
     // ========================================================
     // SAVE FOR REPORTS PAGE
