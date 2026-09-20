@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from "react"
+import { GoogleOAuthProvider } from "@react-oauth/google"
 
 import Login from "./pages/Login"
 import Rooms from "./pages/Rooms"
@@ -14,6 +15,10 @@ const DEFAULT_SETTINGS = {
   academicYear: "2026–27",
   theme: "light",
 }
+
+const GOOGLE_CLIENT_ID =
+  import.meta.env.VITE_GOOGLE_CLIENT_ID ||
+  "174923876048-vbbcqgnf8qap8lnis48im5cdmjl1ovd1.apps.googleusercontent.com"
 
 const API_BASE_URL =
   window.location.hostname === "localhost" ||
@@ -489,11 +494,13 @@ function App() {
 
   if (!isLoggedIn) {
     return (
-      <Login
-        onLogin={
-          handleLogin
-        }
-      />
+      <GoogleOAuthProvider clientId={GOOGLE_CLIENT_ID}>
+        <Login
+          onLogin={
+            handleLogin
+          }
+        />
+      </GoogleOAuthProvider>
     )
   }
 
