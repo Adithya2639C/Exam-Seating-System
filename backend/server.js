@@ -6,6 +6,7 @@ const cors = require("cors")
 
 const Exam = require("./models/Exam")
 const Room = require("./models/Room")
+const requireAuth = require("./middleware/auth")
 
 const app = express()
 
@@ -56,7 +57,21 @@ app.get("/api/health", (req, res) => {
         : "disconnected",
   })
 })
+// ============================================================
+// AUTHENTICATED USER
+// ============================================================
 
+app.get("/api/auth/me", requireAuth, (req, res) => {
+  res.json({
+    user: {
+      id: req.user._id,
+      googleId: req.user.googleId,
+      email: req.user.email,
+      name: req.user.name,
+      picture: req.user.picture,
+    },
+  })
+})
 // ============================================================
 // GET ALL ROOMS
 // ============================================================

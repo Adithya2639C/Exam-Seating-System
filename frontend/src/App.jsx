@@ -190,9 +190,66 @@ function App() {
   // LOGIN
   // =========================================================
 
-  function handleLogin() {
-    setIsLoggedIn(true)
-    setPage("dashboard")
+  async function handleLogin(googleCredential) {
+    try {
+      if (!googleCredential) {
+        localStorage.setItem(
+          "examSystemLoggedIn",
+          "true"
+        )
+
+        setIsLoggedIn(true)
+        setPage("dashboard")
+        return
+      }
+
+      const response = await fetch(
+        `${API_BASE_URL}/auth/me`,
+        {
+          method: "GET",
+          headers: {
+            Authorization: `Bearer ${googleCredential}`,
+          },
+        }
+      )
+
+      const data = await response.json()
+
+      if (!response.ok) {
+        throw new Error(
+          data?.message ||
+          "Google authentication failed."
+        )
+      }
+
+      localStorage.setItem(
+        "examSystemLoggedIn",
+        "true"
+      )
+
+      localStorage.setItem(
+        "googleCredential",
+        googleCredential
+      )
+
+      localStorage.setItem(
+        "examSystemUser",
+        JSON.stringify(data.user)
+      )
+
+      setIsLoggedIn(true)
+      setPage("dashboard")
+    } catch (error) {
+      console.error(
+        "Login error:",
+        error
+      )
+
+      alert(
+        error.message ||
+        "Login failed. Please try again."
+      )
+    }
   }
 
   // =========================================================
@@ -200,6 +257,18 @@ function App() {
   // =========================================================
 
   function handleLogout() {
+    localStorage.removeItem(
+      "examSystemLoggedIn"
+    )
+
+    localStorage.removeItem(
+      "googleCredential"
+    )
+
+    localStorage.removeItem(
+      "examSystemUser"
+    )
+
     setIsLoggedIn(false)
     setPage("dashboard")
     setSidebarOpen(false)

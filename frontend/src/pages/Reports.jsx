@@ -190,452 +190,235 @@ function getAssignedStudents(
 }
 
 // ============================================================
-// BUILD MAIN GATE REPORT
+// BUILD CLEAN ROLL-NUMBER RUNS
 //
-// One class/section = ONE COMPLETE BOX.
-//
-// Example:
-//
-// ┌──────────────────────────────────────────────┐
-// │ CLASS │ ROLL RANGE │ ALLOTTED ROOM │ STRENGTH│
-// ├───────┼────────────┼───────────────┼─────────┤
-// │       │ 12101-109  │ 9 A           │    9    │
-// │ 12 A  │ 12110-118  │ 9 B           │    9    │
-// │       │ 12119-127  │ 9 C           │    9    │
-// │       │ 12128-136  │ 9 D           │    9    │
-// │       │ 12137-149  │ 10 A          │   13    │
-// └──────────────────────────────────────────────┘
+// The Seating Arrangement page now allocates contiguous roll blocks to each
+// room. These helpers therefore group the actual assigned students into
+// consecutive roll ranges instead of creating one row per student.
 // ============================================================
 
-function buildMainGateGroups(
-  assignedStudents
-) {
-  const grouped = {}
-
-  // ----------------------------------------------------------
-  // GROUP BY ORIGINAL CLASS / SECTION
-  // ----------------------------------------------------------
-
-  assignedStudents.forEach(
-    (student) => {
-      if (
-        !grouped[
-          student.classKey
-        ]
-      ) {
-        grouped[
-          student.classKey
-        ] = {
-          classNumber:
-            student.classNumber,
-
-          section:
-            student.section,
-
-          classKey:
-            student.classKey,
-
-          students: [],
-        }
-      }
-
-      grouped[
-        student.classKey
-      ].students.push(
-        student
-      )
-    }
+function buildConsecutiveRollRuns(students) {
+  const sorted = [...(students || [])].sort(
+    (a, b) => Number(a.rollNumber || 0) - Number(b.rollNumber || 0)
   )
 
-  // ----------------------------------------------------------
-  // SORT CLASSES
-  // ----------------------------------------------------------
+  const runs = []
 
-  const groups =
-    Object.values(
-      grouped
-    ).sort(
-      (a, b) => {
-        const classDifference =
-          Number(
-            a.classNumber
-          ) -
-          Number(
-            b.classNumber
-          )
+  if (!sorted.length) return runs
 
-        if (
-          classDifference !==
-          0
-        ) {
-          return classDifference
+  let currentRun = [sorted[0]]
+
+  for (let index = 1; index < sorted.length; index += 1) {
+    const previous = sorted[index - 1]
+    const current = sorted[index]
+
+    if (
+      Number(current.rollNumber || 0) ===
+      Number(previous.rollNumber || 0) + 1
+    ) {
+      currentRun.push(current)
+      continue
+    }
+
+    runs.push(currentRun)
+    currentRun = [current]
+  }
+
+  runs.push(currentRun)
+  return runs
+}
+
+function buildMainGateGroups(assignedStudents) {
+  const classMap = {}
+
+  ;(assignedStudents || []).forEach((student) => {
+    const classKey = String(student.classKey || `${student.classNumber}${student.section}`)
+
+    if (!classMap[classKey]) {
+      classMap[classKey] = {
+        classNumber: student.classNumber,
+        section: student.section,
+        classKey,
+        students: [],
+      }
+    }
+
+    classMap[classKey].students.push(student)
+  })
+
+  return Object.values(classMap)
+    .sort((a, b) => {
+      const classDifference =
+        Number(a.classNumber || 0) - Number(b.classNumber || 0)
+
+      if (classDifference !== 0) return classDifference
+
+      return String(a.section || '').localeCompare(
+        String(b.section || ''),
+        undefined,
+        { numeric: true }
+      )
+    })
+    .map((group) => {
+      const roomMap = {}
+
+      group.students.forEach((student) => {
+        const roomKey = String(student.roomName || 'Unknown Room')
+        if (!roomMap[roomKey]) {
+          roomMap[roomKey] = {
+            roomName: roomKey,
+            roomType: student.roomType || '',
+            students: [],
+          }
         }
 
-        return a.section.localeCompare(
-          b.section
-        )
-      }
-    )
-
-  // ----------------------------------------------------------
-  // BUILD ALLOTMENT RANGES
-  // ----------------------------------------------------------
-
-  return groups.map(
-    (group) => {
-      const students =
-        [...group.students].sort(
-          (a, b) =>
-            a.rollNumber -
-            b.rollNumber
-        )
+        roomMap[roomKey].students.push(student)
+      })
 
       const rows = []
 
-      if (
-        students.length ===
-        0
-      ) {
-        return {
-          ...group,
-          rows: [],
-        }
-      }
+      Object.values(roomMap)
+        .sort((a, b) => {
+          const firstA = Math.min(
+            ...(a.students || []).map((student) => Number(student.rollNumber || 0))
+          )
+          const firstB = Math.min(
+            ...(b.students || []).map((student) => Number(student.rollNumber || 0))
+          )
 
-      let start =
-        students[0]
-
-      let end =
-        students[0]
-
-      let currentRoom =
-        students[0].roomName
-
-      for (
-        let i = 1;
-        i < students.length;
-        i++
-      ) {
-        const current =
-          students[i]
-
-        const consecutive =
-          current.rollNumber ===
-          end.rollNumber + 1
-
-        const sameRoom =
-          current.roomName ===
-          currentRoom
-
-        if (
-          consecutive &&
-          sameRoom
-        ) {
-          end =
-            current
-
-          continue
-        }
-
-        rows.push({
-          startRoll:
-            start.rollNumber,
-
-          endRoll:
-            end.rollNumber,
-
-          roomName:
-            currentRoom,
-
-          roomType:
-            start.roomType,
-
-          count:
-            end.rollNumber -
-            start.rollNumber +
-            1,
+          return (
+            firstA - firstB ||
+            a.roomName.localeCompare(b.roomName, undefined, { numeric: true })
+          )
         })
+        .forEach((room) => {
+          buildConsecutiveRollRuns(room.students).forEach((run) => {
+            const first = run[0]
+            const last = run[run.length - 1]
 
-        start =
-          current
-
-        end =
-          current
-
-        currentRoom =
-          current.roomName
-      }
-
-      // Final range.
-      rows.push({
-        startRoll:
-          start.rollNumber,
-
-        endRoll:
-          end.rollNumber,
-
-        roomName:
-          currentRoom,
-
-        roomType:
-          start.roomType,
-
-        count:
-          end.rollNumber -
-          start.rollNumber +
-          1,
-      })
+            rows.push({
+              startRoll: Number(first.rollNumber || 0),
+              endRoll: Number(last.rollNumber || 0),
+              roomName: room.roomName,
+              roomType: room.roomType,
+              count: run.length,
+            })
+          })
+        })
 
       return {
         ...group,
         rows,
       }
-    }
-  )
+    })
 }
 
-// ============================================================
-// BUILD ROOM-WISE REPORT
-//
-// One room = ONE TABLE.
-//
-// Example:
-//
-// ROOM: CLASS 9
-//
-// 6102-6105   6 A   4
-// 7108-7112   7 A   5
-// 8209-8221   8 B  13
-// ============================================================
-
-function buildRoomWiseGroups(
-  assignedStudents
-) {
+function buildRoomWiseGroups(assignedStudents) {
   const roomMap = {}
 
-  // ----------------------------------------------------------
-  // GROUP BY ROOM
-  // ----------------------------------------------------------
+  ;(assignedStudents || []).forEach((student) => {
+    const roomKey = String(student.roomName || 'Unknown Room')
 
-  assignedStudents.forEach(
-    (student) => {
-      if (
-        !roomMap[
-          student.roomName
-        ]
-      ) {
-        roomMap[
-          student.roomName
-        ] = {
-          roomName:
-            student.roomName,
-
-          roomType:
-            student.roomType,
-
-          students: [],
-        }
+    if (!roomMap[roomKey]) {
+      roomMap[roomKey] = {
+        roomName: roomKey,
+        roomType: student.roomType || '',
+        students: [],
       }
-
-      roomMap[
-        student.roomName
-      ].students.push(
-        student
-      )
     }
-  )
 
-  // ----------------------------------------------------------
-  // SORT ROOMS
-  // ----------------------------------------------------------
+    roomMap[roomKey].students.push(student)
+  })
 
-  const rooms =
-    Object.values(
-      roomMap
-    ).sort(
-      (a, b) =>
-        a.roomName.localeCompare(
-          b.roomName,
-          undefined,
-          {
-            numeric: true,
-          }
-        )
+  return Object.values(roomMap)
+    .sort((a, b) =>
+      a.roomName.localeCompare(
+        b.roomName,
+        undefined,
+        { numeric: true }
+      )
     )
-
-  // ----------------------------------------------------------
-  // BUILD TABLE ROWS
-  // ----------------------------------------------------------
-
-  return rooms.map(
-    (room) => {
+    .map((room) => {
       const classMap = {}
 
-      room.students.forEach(
-        (student) => {
-          if (
-            !classMap[
-              student.classKey
-            ]
-          ) {
-            classMap[
-              student.classKey
-            ] = {
-              classNumber:
-                student.classNumber,
-
-              section:
-                student.section,
-
-              classKey:
-                student.classKey,
-
-              students: [],
-            }
-          }
-
-          classMap[
-            student.classKey
-          ].students.push(
-            student
-          )
-        }
-      )
-
-      const classes =
-        Object.values(
-          classMap
-        ).sort(
-          (a, b) => {
-            const classDifference =
-              Number(
-                a.classNumber
-              ) -
-              Number(
-                b.classNumber
-              )
-
-            if (
-              classDifference !==
-              0
-            ) {
-              return classDifference
-            }
-
-            return a.section.localeCompare(
-              b.section
-            )
-          }
+      room.students.forEach((student) => {
+        const classKey = String(
+          student.classKey ||
+          `${student.classNumber}${student.section}`
         )
+
+        if (!classMap[classKey]) {
+          classMap[classKey] = {
+            classNumber: student.classNumber,
+            section: student.section,
+            classKey,
+            students: [],
+          }
+        }
+
+        classMap[classKey].students.push(student)
+      })
 
       const rows = []
 
-      classes.forEach(
-        (classGroup) => {
-          const students =
-            [
-              ...classGroup.students,
-            ].sort(
-              (a, b) =>
-                a.rollNumber -
-                b.rollNumber
-            )
+      Object.values(classMap)
+        .sort((a, b) => {
+          const classDifference =
+            Number(a.classNumber || 0) - Number(b.classNumber || 0)
 
-          if (
-            students.length ===
-            0
-          ) {
-            return
-          }
+          if (classDifference !== 0) return classDifference
 
-          let start =
-            students[0]
-
-          let end =
-            students[0]
-
-          for (
-            let i = 1;
-            i < students.length;
-            i++
-          ) {
-            const current =
-              students[i]
-
-            if (
-              current.rollNumber ===
-              end.rollNumber + 1
-            ) {
-              end =
-                current
-
-              continue
-            }
+          return String(a.section || '').localeCompare(
+            String(b.section || ''),
+            undefined,
+            { numeric: true }
+          )
+        })
+        .forEach((classGroup) => {
+          buildConsecutiveRollRuns(classGroup.students).forEach((run) => {
+            const first = run[0]
+            const last = run[run.length - 1]
 
             rows.push({
-              classNumber:
-                classGroup.classNumber,
-
-              section:
-                classGroup.section,
-
-              classKey:
-                classGroup.classKey,
-
-              startRoll:
-                start.rollNumber,
-
-              endRoll:
-                end.rollNumber,
-
-              count:
-                end.rollNumber -
-                start.rollNumber +
-                1,
+              classNumber: classGroup.classNumber,
+              section: classGroup.section,
+              classKey: classGroup.classKey,
+              startRoll: Number(first.rollNumber || 0),
+              endRoll: Number(last.rollNumber || 0),
+              count: run.length,
             })
-
-            start =
-              current
-
-            end =
-              current
-          }
-
-          rows.push({
-            classNumber:
-              classGroup.classNumber,
-
-            section:
-              classGroup.section,
-
-            classKey:
-              classGroup.classKey,
-
-            startRoll:
-              start.rollNumber,
-
-            endRoll:
-              end.rollNumber,
-
-            count:
-              end.rollNumber -
-              start.rollNumber +
-              1,
           })
-        }
-      )
+        })
 
       return {
-        roomName:
-          room.roomName,
-
-        roomType:
-          room.roomType,
-
+        roomName: room.roomName,
+        roomType: room.roomType,
         rows,
       }
-    }
+    })
+}
+
+function formatRollRange(
+  classNumber,
+  section,
+  startRoll,
+  endRoll
+) {
+  const start = formatRollNumber(
+    classNumber,
+    section,
+    startRoll
   )
+
+  const end = formatRollNumber(
+    classNumber,
+    section,
+    endRoll
+  )
+
+  return start === end
+    ? start
+    : `${start} – ${end}`
 }
 
 // ============================================================
@@ -1878,19 +1661,10 @@ function Reports() {
                               ">
 
                                 {
-                                  formatRollNumber(
+                                  formatRollRange(
                                     group.classNumber,
                                     group.section,
-                                    row.startRoll
-                                  )
-                                }
-
-                                {" – "}
-
-                                {
-                                  formatRollNumber(
-                                    group.classNumber,
-                                    group.section,
+                                    row.startRoll,
                                     row.endRoll
                                   )
                                 }
@@ -2164,22 +1938,13 @@ function Reports() {
                                 ">
 
                                   {
-                                    formatRollNumber(
+                                    formatRollRange(
                                       row.classNumber,
                                       row.section,
-                                      row.startRoll
-                                    )
-                                  }
-
-                                  {" – "}
-
-                                  {
-                                    formatRollNumber(
-                                      row.classNumber,
-                                      row.section,
+                                      row.startRoll,
                                       row.endRoll
                                     )
-                                  }
+                                }
 
                                 </td>
 

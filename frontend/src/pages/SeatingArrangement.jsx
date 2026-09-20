@@ -3,6 +3,51 @@ import { useEffect, useMemo, useState } from "react"
 const ROOMS_API_URL =
   "https://smart-exam-backend-dg42.onrender.com/api/rooms"
 
+const SEATING_STATE_KEY = "smartExamSeatingArrangementState"
+
+function loadSavedSeatingState() {
+  try {
+    const saved = localStorage.getItem(SEATING_STATE_KEY)
+
+    if (!saved) {
+      return {
+        selectedClasses: {},
+        selectedRoomIds: [],
+        generatedRooms: [],
+        generated: false,
+      }
+    }
+
+    const parsed = JSON.parse(saved)
+
+    return {
+      selectedClasses:
+        parsed && typeof parsed.selectedClasses === "object"
+          ? parsed.selectedClasses
+          : {},
+      selectedRoomIds:
+        parsed && Array.isArray(parsed.selectedRoomIds)
+          ? parsed.selectedRoomIds
+          : [],
+      generatedRooms:
+        parsed && Array.isArray(parsed.generatedRooms)
+          ? parsed.generatedRooms
+          : [],
+      generated:
+        Boolean(parsed?.generated),
+    }
+  } catch (error) {
+    console.error("Failed to restore saved seating state:", error)
+
+    return {
+      selectedClasses: {},
+      selectedRoomIds: [],
+      generatedRooms: [],
+      generated: false,
+    }
+  }
+}
+
 // ============================================================
 // CLASS KEY
 // ============================================================
@@ -642,6 +687,81 @@ function classesConflict(
   )
 }
 
+
+
+// ============================================================
+// SAFE PLACEMENT HELPERS
+// Defined here at module scope before any generator/repair code
+// uses them. These are the single source of truth for the automatic
+// fill and classroom/Large Hall repair passes.
+// ============================================================
+
+function getStrictClassroomAdjacentSeats(result, targetSeat) {
+  const seats = Array.isArray(result?.seats) ? result.seats : []
+  const targetFurnitureId = String(
+    targetSeat?.furnitureId ?? targetSeat?.id ?? ''
+  )
+
+  return seats.filter((seat) => {
+    if (!seat || seat === targetSeat || !seat.student) return false
+
+    const furnitureId = String(seat.furnitureId ?? seat.id ?? '')
+    return furnitureId === targetFurnitureId
+  })
+}
+
+function safeAtClassroomBoundary(
+  result,
+  targetSeat,
+  replacementStudent,
+  restrictions = []
+) {
+  if (!replacementStudent) return false
+
+  return getStrictClassroomAdjacentSeats(result, targetSeat).every((seat) => {
+    if (!seat?.student) return true
+
+    return !classesConflict(
+      replacementStudent.classKey,
+      seat.student.classKey,
+      restrictions
+    )
+  })
+}
+
+function safeAtLargeHall(
+  hallResult,
+  targetSeat,
+  replacementStudent,
+  restrictions = []
+) {
+  if (!replacementStudent) return false
+
+  const seats = Array.isArray(hallResult?.seats) ? hallResult.seats : []
+  const targetRow = Number(targetSeat?.row ?? 0)
+  const targetColumn = Number(targetSeat?.column ?? 0)
+
+  return seats
+    .filter((seat) => {
+      if (!seat || seat === targetSeat || !seat.student) return false
+
+      const row = Number(seat.row ?? 0)
+      const column = Number(seat.column ?? 0)
+
+      return (
+        (row === targetRow && Math.abs(column - targetColumn) === 1) ||
+        (column === targetColumn && Math.abs(row - targetRow) === 1)
+      )
+    })
+    .every((seat) =>
+      !classesConflict(
+        replacementStudent.classKey,
+        seat.student.classKey,
+        restrictions
+      )
+    )
+}
+
 // ============================================================
 // ANTI-CHEATING SEATING HELPERS
 // ============================================================
@@ -705,29 +825,20 @@ function shuffleArray(items) {
 function prepareStudents(students) {
   const pools = {}
 
-  // Keep roll numbers CONTINUOUS within each class.
-  // Randomness is handled at the seating/class-choice level, not by
-  // scattering roll numbers from the same class.
+  // Keep students grouped by class, but RANDOMIZE the order inside each
+  // class so roll numbers are never seated sequentially.
   ;[...(students || [])]
-    .sort((a, b) => {
-      const classCompare = String(a.classKey || "").localeCompare(
-        String(b.classKey || ""),
-        undefined,
-        { numeric: true }
-      )
-
-      if (classCompare !== 0) return classCompare
-
-      return (
-        Number(a.rollNumber ?? 0) -
-        Number(b.rollNumber ?? 0)
-      )
-    })
     .forEach((student) => {
       const key = student.classKey
       if (!pools[key]) pools[key] = []
       pools[key].push(student)
     })
+
+  Object.keys(pools).forEach((classKey) => {
+    pools[classKey] = shuffleArray(
+      pools[classKey]
+    )
+  })
 
   return pools
 }
@@ -740,29 +851,57 @@ function buildContinuousRandomStudentOrder(students) {
   const grouped = {}
 
   ;[...(students || [])]
-    .sort((a, b) => {
-      const classCompare = String(a.classKey || "").localeCompare(
-        String(b.classKey || ""),
-        undefined,
-        { numeric: true }
-      )
-
-      if (classCompare !== 0) return classCompare
-
-      return (
-        Number(a.rollNumber ?? 0) -
-        Number(b.rollNumber ?? 0)
-      )
-    })
     .forEach((student) => {
       const key = student.classKey
       if (!grouped[key]) grouped[key] = []
       grouped[key].push(student)
     })
 
+  Object.keys(grouped).forEach((classKey) => {
+    grouped[classKey] = shuffleArray(
+      grouped[classKey]
+    )
+  })
+
+  // Keep overall class blocks randomized, while students inside each block
+  // are also randomized rather than being roll-number ordered.
   const classKeys = shuffleArray(Object.keys(grouped))
 
   return classKeys.flatMap((classKey) => grouped[classKey])
+}
+
+
+// Build the student stream used ONLY for ROOM ALLOCATION / REPORT RANGES.
+// Students stay in roll-number order inside each original section.
+// Physical seating is still randomized later by the seating generators.
+function buildContinuousAllocationStudentOrder(students) {
+  const grouped = {}
+
+  ;[...(students || [])].forEach((student) => {
+    const key = String(student.classKey || '')
+    if (!grouped[key]) grouped[key] = []
+    grouped[key].push(student)
+  })
+
+  Object.keys(grouped).forEach((classKey) => {
+    grouped[classKey].sort((a, b) => {
+      const sectionDifference = String(a.section || '').localeCompare(
+        String(b.section || ''),
+        undefined,
+        { numeric: true }
+      )
+
+      if (sectionDifference !== 0) return sectionDifference
+
+      return Number(a.rollNumber ?? 0) - Number(b.rollNumber ?? 0)
+    })
+  })
+
+  return Object.keys(grouped)
+    .sort((a, b) =>
+      String(a).localeCompare(String(b), undefined, { numeric: true })
+    )
+    .flatMap((classKey) => grouped[classKey])
 }
 
 function getAvailableClasses(pools, pointers) {
@@ -801,6 +940,7 @@ function scoreClassChoice({
   previousClassKeys,
   recentClasses,
   restrictions = [],
+  spatialContext = {},
 }) {
   const student = getNextStudent(pools, pointers, classKey)
   if (!student) return Number.NEGATIVE_INFINITY
@@ -817,13 +957,55 @@ function scoreClassChoice({
 
   if (recentClasses.has(classNumber)) score -= 12
 
-  // Prefer the class with more remaining students only after safety.
+  // Do not let large remaining pools dominate the room. A small bonus is
+  // enough to keep the algorithm from starving large classes while still
+  // strongly preferring a mixed spatial pattern.
   score += Math.min(
-    20,
+    8,
     pools[classKey].length - pointers[classKey]
   )
 
-  // Prefer a different section as well when the overall class is different.
+  const benchColumn =
+    spatialContext?.benchColumn != null
+      ? String(spatialContext.benchColumn)
+      : null
+
+  const rowClassUsage =
+    spatialContext?.rowClassUsage || {}
+
+  const columnClassUsage =
+    spatialContext?.columnClassUsage || {}
+
+  const previousColumnClasses =
+    spatialContext?.previousColumnClasses || new Set()
+
+  if (classNumber !== null) {
+    const usedInCurrentRow = Number(
+      rowClassUsage[classNumber] || 0
+    )
+
+    const usedInColumn = Number(
+      columnClassUsage?.[benchColumn]?.[classNumber] || 0
+    )
+
+    // Strong preference for classes not already used elsewhere in this row.
+    score -= usedInCurrentRow * 45
+    if (usedInCurrentRow === 0) score += 35
+
+    // Discourage repeating the same overall class down the same physical
+    // column. This directly fixes rooms that visually become 9/10/9/10
+    // down one side while other classes are pushed elsewhere.
+    score -= usedInColumn * 22
+
+    if (previousColumnClasses.has(classNumber)) {
+      score -= 75
+    } else {
+      score += 18
+    }
+  }
+
+  // Prefer a different overall class from the student already placed on the
+  // same bench. The hard duplicate-class rule is still enforced elsewhere.
   if (benchStudents.length > 0) {
     const last = benchStudents[benchStudents.length - 1]
     if (last && !sameClass(student, last)) score += 30
@@ -849,7 +1031,8 @@ function chooseDifferentClass(
   pointers,
   benchStudents,
   recentClasses,
-  restrictions = []
+  restrictions = [],
+  spatialContext = {},
 ) {
   const possible = availableClasses.filter((classKey) => {
     const student = getNextStudent(pools, pointers, classKey)
@@ -867,6 +1050,7 @@ function chooseDifferentClass(
       previousClassKeys: null,
       recentClasses,
       restrictions,
+      spatialContext,
     })
 
     const scoreB = scoreClassChoice({
@@ -877,12 +1061,11 @@ function chooseDifferentClass(
       previousClassKeys: null,
       recentClasses,
       restrictions,
+      spatialContext,
     })
 
     if (scoreA !== scoreB) return scoreB - scoreA
 
-    // When multiple classes are equally safe/equally preferred,
-    // randomize the tie instead of falling back to roll/class order.
     return Math.random() - 0.5
   })
 
@@ -899,7 +1082,8 @@ function fillBench(
   pointers,
   availableClasses,
   recentClasses,
-  restrictions = []
+  restrictions = [],
+  spatialContext = {},
 ) {
   const capacity = Math.max(
     1,
@@ -917,7 +1101,8 @@ function fillBench(
   const benchStudents = []
 
   // First priority: fill every position with a different overall class.
-  // This automatically keeps 2-seat benches different-class.
+  // Spatial scoring deliberately favors classes that have not appeared in
+  // the same row/column recently, while the hard bench rule remains intact.
   for (let position = 0; position < capacity; position++) {
     const currentAvailable = getAvailableClasses(pools, pointers)
 
@@ -927,7 +1112,8 @@ function fillBench(
       pointers,
       benchStudents,
       recentClasses,
-      restrictions
+      restrictions,
+      spatialContext,
     )
 
     if (!selectedClass) break
@@ -946,9 +1132,8 @@ function fillBench(
     recentClasses.add(getClassNumber(selectedClass))
   }
 
-  // Second priority: fill any remaining positions ONLY with a student
-  // whose overall class is not already present anywhere on this bench.
-  // The rule is bench-wide, not merely adjacent-seat based.
+  // Second priority: fill any remaining positions ONLY with a student whose
+  // overall class is not already present on this bench.
   for (const position of positions) {
     if (position.student) continue
 
@@ -957,12 +1142,10 @@ function fillBench(
         const student = getNextStudent(pools, pointers, classKey)
         if (!student) return false
 
-        // No overall class may appear twice on the same bench.
         if (benchStudents.some((other) => sameClass(student, other))) {
           return false
         }
 
-        // Existing class-pair restrictions remain hard constraints.
         if (
           benchStudents.some((other) =>
             areClassesRestricted(
@@ -990,6 +1173,7 @@ function fillBench(
         previousClassKeys: null,
         recentClasses,
         restrictions,
+        spatialContext,
       })
 
       const scoreB = scoreClassChoice({
@@ -1000,6 +1184,7 @@ function fillBench(
         previousClassKeys: null,
         recentClasses,
         restrictions,
+        spatialContext,
       })
 
       if (scoreA !== scoreB) return scoreB - scoreA
@@ -1051,22 +1236,51 @@ function generateSeatingPlan(
     pointers[classKey] = 0
   })
 
+  // IMPORTANT:
+  // Process benches ROW-FIRST rather than COLUMN-FIRST.
+  // This means a visual row is completed from left -> right before moving
+  // down. The class-mixing scores below can therefore actively separate
+  // classes across the side/middle columns instead of filling an entire
+  // side column with one or two classes first.
   const orderedBenches = [...benches].sort((a, b) => {
-    const columnDifference =
-      Number(a.column ?? 0) - Number(b.column ?? 0)
+    const rowDifference =
+      Number(a.row ?? 0) - Number(b.row ?? 0)
 
-    if (columnDifference !== 0) return columnDifference
+    if (rowDifference !== 0) return rowDifference
 
     return (
-      Number(a.row ?? 0) - Number(b.row ?? 0)
+      Number(a.column ?? 0) - Number(b.column ?? 0)
     )
   })
 
   const results = []
   const recentClasses = new Set()
 
+  let currentRow = null
+  const rowClassUsage = {}
+  const columnClassUsage = {}
+  const previousColumnClasses = {}
+
   orderedBenches.forEach((bench) => {
-    const availableClasses = getAvailableClasses(pools, pointers)
+    const row = Number(bench.row ?? 0)
+    const column = String(bench.column ?? 0)
+
+    if (currentRow === null || currentRow !== row) {
+      currentRow = row
+
+      Object.keys(rowClassUsage).forEach((key) => {
+        delete rowClassUsage[key]
+      })
+    }
+
+    if (!columnClassUsage[column]) {
+      columnClassUsage[column] = {}
+    }
+
+    const availableClasses = getAvailableClasses(
+      pools,
+      pointers
+    )
 
     if (availableClasses.length === 0) {
       results.push({
@@ -1093,12 +1307,40 @@ function generateSeatingPlan(
       pointers,
       availableClasses,
       recentClasses,
-      restrictions
+      restrictions,
+      {
+        benchColumn: column,
+        rowClassUsage,
+        columnClassUsage,
+        previousColumnClasses:
+          previousColumnClasses[column] || new Set(),
+      }
     )
 
     results.push(result)
 
-    if (recentClasses.size > 7) {
+    const classesInThisBench = new Set()
+
+    result.positions.forEach((position) => {
+      const student = position.student
+      if (!student) return
+
+      const classNumber = getClassNumber(
+        student.classKey
+      )
+
+      if (classNumber === null) return
+
+      classesInThisBench.add(classNumber)
+      rowClassUsage[classNumber] =
+        (rowClassUsage[classNumber] || 0) + 1
+      columnClassUsage[column][classNumber] =
+        (columnClassUsage[column][classNumber] || 0) + 1
+    })
+
+    previousColumnClasses[column] = classesInThisBench
+
+    if (recentClasses.size > 10) {
       const first = recentClasses.values().next().value
       recentClasses.delete(first)
     }
@@ -1972,6 +2214,863 @@ function generateClassroomSeating(
   }
 }
 
+
+// ============================================================
+// AUTOMATIC EMPTY-SEAT FILL
+// ============================================================
+// After the balanced pass and boundary repair, there can still be students
+// from a section that was legitimately selected for a room but could not fit
+// its original quota because of physical adjacency restrictions. Rather than
+// making the user manually place those students, we use any remaining safe
+// seats in the same room and keep the exact same selected section.
+//
+// This pass NEVER introduces a second section of an overall class into a
+// room, and it NEVER introduces a sixth overall class. It only fills seats
+// using a class/section that is already part of that room's plan.
+// ============================================================
+
+function getRoomClassSeatCounts(result) {
+  const counts = {}
+
+  ;(result?.seats || []).forEach((seat) => {
+    if (!seat?.student) return
+
+    const classKey = getStudentOverallClassKey(seat.student)
+    counts[classKey] = (counts[classKey] || 0) + 1
+  })
+
+  return counts
+}
+
+function getRoomRowClassCounts(result) {
+  const counts = {}
+
+  ;(result?.seats || []).forEach((seat) => {
+    if (!seat?.student) return
+
+    const row = String(Number(seat.row ?? 0))
+    const classKey = getStudentOverallClassKey(seat.student)
+
+    if (!counts[row]) counts[row] = {}
+    counts[row][classKey] =
+      (counts[row][classKey] || 0) + 1
+  })
+
+  return counts
+}
+
+function getRoomColumnClassCounts(result) {
+  const counts = {}
+
+  ;(result?.seats || []).forEach((seat) => {
+    if (!seat?.student) return
+
+    const column = String(Number(seat.column ?? 0))
+    const classKey = getStudentOverallClassKey(seat.student)
+
+    if (!counts[column]) counts[column] = {}
+    counts[column][classKey] =
+      (counts[column][classKey] || 0) + 1
+  })
+
+  return counts
+}
+
+function isStudentAllowedByRoomSection(result, student) {
+  if (!result || !student) return false
+
+  const classKey = getStudentOverallClassKey(student)
+  const selectedSection =
+    result.sectionDistribution?.[classKey]?.sectionKey
+
+  if (!selectedSection) return false
+
+  return getStudentSectionKey(student) === selectedSection
+}
+
+function isSafeForAutomaticFill(
+  result,
+  seat,
+  student,
+  restrictions = []
+) {
+  if (!result || !seat || !student) return false
+
+  if (result.room?.type === "Large Hall") {
+    return safeAtLargeHall(
+      result,
+      seat,
+      student,
+      restrictions
+    )
+  }
+
+  return safeAtClassroomBoundary(
+    result,
+    seat,
+    student,
+    restrictions
+  )
+}
+
+function scoreAutomaticFillCandidate(
+  result,
+  seat,
+  student,
+  classCounts,
+  rowCounts,
+  columnCounts
+) {
+  const classKey = getStudentOverallClassKey(student)
+  const row = String(Number(seat?.row ?? 0))
+  const column = String(Number(seat?.column ?? 0))
+
+  const sameClassInRoom =
+    Number(classCounts?.[classKey] || 0)
+
+  const sameClassInRow =
+    Number(rowCounts?.[row]?.[classKey] || 0)
+
+  const sameClassInColumn =
+    Number(columnCounts?.[column]?.[classKey] || 0)
+
+  let score = 0
+
+  // Prefer a class that is currently underrepresented in this room.
+  score -= sameClassInRoom * 60
+
+  // Strongly mix each visual row.
+  score -= sameClassInRow * 50
+
+  // Keep the same overall class from building up down one side column.
+  score -= sameClassInColumn * 30
+
+  // Small randomness prevents deterministic alphabetical patterns.
+  score += Math.random() * 10
+
+  return score
+}
+
+function autoFillRemainingStudents(
+  results,
+  remainingStudents,
+  restrictions = []
+) {
+  let remaining = [...(remainingStudents || [])]
+  let madeProgress = true
+
+  while (madeProgress && remaining.length > 0) {
+    madeProgress = false
+
+    for (const result of results || []) {
+      const emptySeats = (result.seats || []).filter(
+        (seat) => !seat?.student
+      )
+
+      if (emptySeats.length === 0) continue
+
+      for (const seat of emptySeats) {
+        if (remaining.length === 0) break
+
+        const classCounts = getRoomClassSeatCounts(result)
+        const rowCounts = getRoomRowClassCounts(result)
+        const columnCounts = getRoomColumnClassCounts(result)
+
+        const candidates = remaining.filter((student) =>
+          isStudentAllowedByRoomSection(result, student) &&
+          isSafeForAutomaticFill(
+            result,
+            seat,
+            student,
+            restrictions
+          )
+        )
+
+        if (candidates.length === 0) continue
+
+        candidates.sort((a, b) => {
+          const scoreA = scoreAutomaticFillCandidate(
+            result,
+            seat,
+            a,
+            classCounts,
+            rowCounts,
+            columnCounts
+          )
+
+          const scoreB = scoreAutomaticFillCandidate(
+            result,
+            seat,
+            b,
+            classCounts,
+            rowCounts,
+            columnCounts
+          )
+
+          if (scoreA !== scoreB) return scoreB - scoreA
+
+          return Math.random() - 0.5
+        })
+
+        const student = candidates[0]
+        const studentId = getStudentId(student)
+        const index = remaining.findIndex(
+          (candidate) =>
+            getStudentId(candidate) === studentId
+        )
+
+        if (index === -1) continue
+
+        seat.student = student
+        remaining.splice(index, 1)
+
+        const classKey = getStudentOverallClassKey(student)
+
+        if (!result.classDistribution) {
+          result.classDistribution = {}
+        }
+
+        result.classDistribution[classKey] =
+          (result.classDistribution[classKey] || 0) + 1
+
+        if (!result.sectionDistribution) {
+          result.sectionDistribution = {}
+        }
+
+        if (result.sectionDistribution[classKey]) {
+          result.sectionDistribution[classKey].studentCount =
+            Number(
+              result.sectionDistribution[classKey].studentCount || 0
+            ) + 1
+        }
+
+        result.assignedStudents =
+          (result.assignedStudents || 0) + 1
+
+        madeProgress = true
+      }
+    }
+  }
+
+  return remaining
+}
+
+
+// ============================================================
+// LARGE HALL -> SMALL ROOM REBALANCING
+// ============================================================
+//
+// After the normal generation, a Classroom/Lab can still have empty seats
+// because its original room quota could not be filled safely. The Large Hall
+// may still contain perfectly valid students in those seats.
+//
+// This pass uses those Large Hall students to fill empty Classroom/Lab seats
+// automatically. It follows the same hard rules as normal seating:
+//   - never put the same overall class twice on one bench / touching boundary
+//   - respect Dashboard class restrictions
+//   - keep only ONE section of an overall class in a room
+//   - never introduce more than 5 overall classes into a room
+//   - when introducing a NEW overall class, move a minimum batch of 5 from
+//     one section so we do not create a 1/2/3/4-student class group
+//
+// Existing room classes are filled first. If the room has fewer than 4
+// overall classes, we may then introduce additional classes from the Large
+// Hall in safe batches of five. This is what prevents a room from becoming
+// dominated by only Class 9 + Class 10 when the Hall still contains 11/12.
+// ============================================================
+
+function getHallStudentEntries(hallResults) {
+  const entries = []
+
+  ;(hallResults || []).forEach((hallResult) => {
+    ;(hallResult?.seats || []).forEach((seat) => {
+      if (!seat?.student) return
+
+      entries.push({
+        hallResult,
+        hallSeat: seat,
+        student: seat.student,
+      })
+    })
+  })
+
+  return entries
+}
+
+function getRoomOverallClassKeys(result) {
+  const keys = new Set()
+
+  ;(result?.seats || []).forEach((seat) => {
+    if (!seat?.student) return
+    keys.add(getStudentOverallClassKey(seat.student))
+  })
+
+  Object.keys(result?.sectionDistribution || {}).forEach((key) => {
+    keys.add(String(key))
+  })
+
+  return keys
+}
+
+function getGlobalOverallClassSeatCounts(results) {
+  const counts = {}
+
+  ;(results || []).forEach((result) => {
+    // Count only Classroom/Lab usage here. The Large Hall is the donor
+    // reservoir, so including its students would make well-supplied Hall
+    // classes look artificially overrepresented.
+    if (result?.room?.type === "Large Hall") return
+
+    ;(result?.seats || []).forEach((seat) => {
+      if (!seat?.student) return
+
+      const classKey = getStudentOverallClassKey(seat.student)
+      counts[classKey] = (counts[classKey] || 0) + 1
+    })
+  })
+
+  return counts
+}
+
+function updateRoomDistributionAfterHallMove(result, student) {
+  if (!result || !student) return
+
+  const classKey = getStudentOverallClassKey(student)
+  const sectionKey = getStudentSectionKey(student)
+
+  if (!result.classDistribution) {
+    result.classDistribution = {}
+  }
+
+  result.classDistribution[classKey] =
+    (result.classDistribution[classKey] || 0) + 1
+
+  if (!result.sectionDistribution) {
+    result.sectionDistribution = {}
+  }
+
+  if (!result.sectionDistribution[classKey]) {
+    result.sectionDistribution[classKey] = {
+      sectionKey,
+      studentCount: 0,
+      availableInSection: 0,
+    }
+  }
+
+  result.sectionDistribution[classKey].sectionKey = sectionKey
+  result.sectionDistribution[classKey].studentCount =
+    Number(result.sectionDistribution[classKey].studentCount || 0) + 1
+
+  if (!Array.isArray(result.classGroup)) {
+    result.classGroup = []
+  }
+
+  if (!result.classGroup.includes(classKey)) {
+    result.classGroup.push(classKey)
+  }
+
+  if (!Array.isArray(result.overallClassGroup)) {
+    result.overallClassGroup = []
+  }
+
+  if (!result.overallClassGroup.includes(classKey)) {
+    result.overallClassGroup.push(classKey)
+  }
+
+  result.assignedStudents =
+    (result.assignedStudents || 0) + 1
+}
+
+function getEmptySmallRoomSeats(result) {
+  return (result?.seats || [])
+    .filter((seat) => !seat?.student)
+    .sort((a, b) => {
+      const columnA = Number(a?.column ?? 0)
+      const columnB = Number(b?.column ?? 0)
+
+      if (columnA !== columnB) return columnA - columnB
+
+      const rowA = Number(a?.row ?? 0)
+      const rowB = Number(b?.row ?? 0)
+
+      return rowA - rowB
+    })
+}
+
+function getHallSectionGroups(hallResults) {
+  const groups = new Map()
+
+  getHallStudentEntries(hallResults).forEach((entry) => {
+    const sectionKey = getStudentSectionKey(entry.student)
+
+    if (!groups.has(sectionKey)) {
+      groups.set(sectionKey, [])
+    }
+
+    groups.get(sectionKey).push(entry)
+  })
+
+  return groups
+}
+
+function chooseNewHallSectionForRoom(
+  result,
+  hallResults,
+  globalClassCounts
+) {
+  const roomClasses = getRoomOverallClassKeys(result)
+
+  if (roomClasses.size >= 5) return null
+
+  const sectionGroups = getHallSectionGroups(hallResults)
+  const candidates = []
+
+  sectionGroups.forEach((entries, sectionKey) => {
+    if (entries.length < 5) return
+
+    const classKey = getStudentOverallClassKey(entries[0].student)
+
+    // The overall class must be new to this room. We only introduce a new
+    // class in a batch of five, preserving the minimum-group rule.
+    if (roomClasses.has(classKey)) return
+
+    const availableCount = entries.length
+    const globalCount = Number(globalClassCounts?.[classKey] || 0)
+
+    candidates.push({
+      sectionKey,
+      classKey,
+      entries,
+      availableCount,
+      globalCount,
+    })
+  })
+
+  if (candidates.length === 0) return null
+
+  candidates.sort((a, b) => {
+    // Prefer overall classes that have been used least in the current
+    // arrangement, which makes underrepresented classes such as 11/12 more
+    // likely to be pulled out of the Hall into the first classrooms.
+    if (a.globalCount !== b.globalCount) {
+      return a.globalCount - b.globalCount
+    }
+
+    // Then prefer a section with enough Hall students to make the transfer
+    // robust and repeatable.
+    if (a.availableCount !== b.availableCount) {
+      return b.availableCount - a.availableCount
+    }
+
+    return Math.random() - 0.5
+  })
+
+  return candidates[0]
+}
+
+function tryMoveNewSectionBatchFromHall(
+  result,
+  hallResults,
+  sectionChoice,
+  restrictions = [],
+  batchSize = 5
+) {
+  if (!result || !sectionChoice) return false
+
+  const emptySeats = getEmptySmallRoomSeats(result)
+  if (emptySeats.length < batchSize) return false
+
+  const candidateEntries = chooseContiguousHallBatch(
+    sectionChoice.entries || [],
+    batchSize
+  )
+
+  if (candidateEntries.length < batchSize) return false
+
+  // Work on a temporary seat state first. If fewer than five students can be
+  // placed safely, abandon the batch completely rather than creating a tiny
+  // new class group.
+  const tempResult = {
+    ...result,
+    seats: (result.seats || []).map((seat) => ({
+      ...seat,
+      student: seat.student || null,
+    })),
+  }
+
+  const unusedEntries = [...candidateEntries]
+  const placements = []
+
+  for (const targetSeat of emptySeats) {
+    if (placements.length >= batchSize) break
+
+    const currentClassCounts = getRoomClassSeatCounts(tempResult)
+    const currentRowCounts = getRoomRowClassCounts(tempResult)
+    const currentColumnCounts = getRoomColumnClassCounts(tempResult)
+
+    const candidates = unusedEntries.filter((entry) =>
+      safeAtClassroomBoundary(
+        tempResult,
+        targetSeat,
+        entry.student,
+        restrictions
+      )
+    )
+
+    if (candidates.length === 0) continue
+
+    candidates.sort((a, b) => {
+      const scoreA = scoreAutomaticFillCandidate(
+        tempResult,
+        targetSeat,
+        a.student,
+        currentClassCounts,
+        currentRowCounts,
+        currentColumnCounts
+      )
+
+      const scoreB = scoreAutomaticFillCandidate(
+        tempResult,
+        targetSeat,
+        b.student,
+        currentClassCounts,
+        currentRowCounts,
+        currentColumnCounts
+      )
+
+      if (scoreA !== scoreB) return scoreB - scoreA
+      return Math.random() - 0.5
+    })
+
+    const chosen = candidates[0]
+    if (!chosen) continue
+
+    const tempSeat = tempResult.seats.find(
+      (seat) => seat.id === targetSeat.id
+    )
+
+    if (!tempSeat) continue
+
+    tempSeat.student = chosen.student
+
+    placements.push({
+      targetSeatId: targetSeat.id,
+      hallResult: chosen.hallResult,
+      hallSeatId: chosen.hallSeat.id,
+      student: chosen.student,
+    })
+
+    const candidateIndex = unusedEntries.findIndex(
+      (entry) => entry.hallSeat.id === chosen.hallSeat.id
+    )
+
+    if (candidateIndex !== -1) {
+      unusedEntries.splice(candidateIndex, 1)
+    }
+  }
+
+  if (placements.length < batchSize) {
+    return false
+  }
+
+  // Commit the successful batch to the real room and remove those students
+  // from the Large Hall.
+  placements.forEach((placement) => {
+    const targetSeat = result.seats.find(
+      (seat) => seat.id === placement.targetSeatId
+    )
+
+    if (targetSeat) {
+      targetSeat.student = placement.student
+    }
+
+    const hallSeat = placement.hallResult.seats.find(
+      (seat) => seat.id === placement.hallSeatId
+    )
+
+    if (hallSeat) {
+      hallSeat.student = null
+    }
+
+    updateRoomDistributionAfterHallMove(
+      result,
+      placement.student
+    )
+
+    placement.hallResult.assignedStudents =
+      (placement.hallResult.seats || []).filter(
+        (seat) => seat.student
+      ).length
+  })
+
+  return true
+}
+
+function getNumericRollNumber(student) {
+  const value = Number(student?.rollNumber)
+  return Number.isFinite(value) ? value : null
+}
+
+function getHallEntryEdgeCandidates(entries) {
+  const sorted = [...(entries || [])].sort((a, b) => {
+    const rollA = getNumericRollNumber(a?.student)
+    const rollB = getNumericRollNumber(b?.student)
+
+    if (rollA === null && rollB === null) return 0
+    if (rollA === null) return 1
+    if (rollB === null) return -1
+    return rollA - rollB
+  })
+
+  if (sorted.length === 0) return []
+
+  const edgeCandidates = []
+  let runStart = 0
+
+  for (let i = 1; i <= sorted.length; i++) {
+    const previousRoll = getNumericRollNumber(sorted[i - 1]?.student)
+    const currentRoll = getNumericRollNumber(sorted[i]?.student)
+    const continues =
+      i < sorted.length &&
+      previousRoll !== null &&
+      currentRoll !== null &&
+      currentRoll === previousRoll + 1
+
+    if (continues) continue
+
+    const run = sorted.slice(runStart, i)
+
+    if (run.length > 0) {
+      edgeCandidates.push(run[0])
+      if (run.length > 1) {
+        edgeCandidates.push(run[run.length - 1])
+      }
+    }
+
+    runStart = i
+  }
+
+  const seen = new Set()
+  return edgeCandidates.filter((entry) => {
+    const id = entry?.hallSeat?.id
+    if (!id || seen.has(id)) return false
+    seen.add(id)
+    return true
+  })
+}
+
+function chooseContiguousHallBatch(entries, batchSize = 5) {
+  const sorted = [...(entries || [])].sort((a, b) => {
+    const rollA = getNumericRollNumber(a?.student)
+    const rollB = getNumericRollNumber(b?.student)
+
+    if (rollA === null && rollB === null) return 0
+    if (rollA === null) return 1
+    if (rollB === null) return -1
+    return rollA - rollB
+  })
+
+  if (sorted.length < batchSize) return []
+
+  let runStart = 0
+
+  for (let i = 1; i <= sorted.length; i++) {
+    const previousRoll = getNumericRollNumber(sorted[i - 1]?.student)
+    const currentRoll = getNumericRollNumber(sorted[i]?.student)
+    const continues =
+      i < sorted.length &&
+      previousRoll !== null &&
+      currentRoll !== null &&
+      currentRoll === previousRoll + 1
+
+    if (continues) continue
+
+    const run = sorted.slice(runStart, i)
+
+    if (run.length >= batchSize) {
+      // Take an edge block so the remaining Hall report stays continuous.
+      return run.slice(0, batchSize)
+    }
+
+    runStart = i
+  }
+
+  return []
+}
+
+function fillEmptySmallRoomSeatsFromLargeHall(
+  results,
+  restrictions = [],
+  priorityRoomLimit = 3
+) {
+  if (!Array.isArray(results) || results.length === 0) {
+    return results
+  }
+
+  const hallResults = results.filter(
+    (result) => result?.room?.type === "Large Hall"
+  )
+
+  const smallRoomResults = results.filter(
+    (result) => result?.room?.type !== "Large Hall"
+  )
+
+  if (hallResults.length === 0 || smallRoomResults.length === 0) {
+    return results
+  }
+
+  // Work on the most-empty rooms first so the visible side columns are filled
+  // before the small remaining gaps in other rooms.
+  const orderedRooms = [...smallRoomResults]
+    .sort((a, b) => {
+      const emptyA = getEmptySmallRoomSeats(a).length
+      const emptyB = getEmptySmallRoomSeats(b).length
+      return emptyB - emptyA
+    })
+    .slice(0, Math.max(1, Number(priorityRoomLimit) || 3))
+
+  // First bring every room toward four overall classes where possible.
+  // This is the main fix for rooms that otherwise contain only 9 + 10.
+  orderedRooms.forEach((result) => {
+    let safetyCounter = 0
+
+    while (
+      getRoomOverallClassKeys(result).size < 4 &&
+      getEmptySmallRoomSeats(result).length >= 5 &&
+      safetyCounter < 10
+    ) {
+      safetyCounter += 1
+
+      const globalCounts = getGlobalOverallClassSeatCounts(results)
+      const sectionChoice = chooseNewHallSectionForRoom(
+        result,
+        hallResults,
+        globalCounts
+      )
+
+      if (!sectionChoice) break
+
+      const moved = tryMoveNewSectionBatchFromHall(
+        result,
+        hallResults,
+        sectionChoice,
+        restrictions,
+        5
+      )
+
+      if (!moved) break
+    }
+  })
+
+  // Then use Hall students from sections already represented in each room to
+  // fill as many remaining empty seats as safely possible. The candidate
+  // score strongly prefers students that reduce same-class concentration in
+  // rows and columns.
+  orderedRooms.forEach((result) => {
+    let madeProgress = true
+    let pass = 0
+
+    while (madeProgress && pass < 20) {
+      madeProgress = false
+      pass += 1
+
+      const emptySeats = getEmptySmallRoomSeats(result)
+      if (emptySeats.length === 0) break
+
+      for (const targetSeat of emptySeats) {
+        const roomSections = new Set(
+          Object.values(result.sectionDistribution || {})
+            .map((item) => item?.sectionKey)
+            .filter(Boolean)
+        )
+
+        const hallEntries = getHallStudentEntries(hallResults).filter(
+          (entry) => roomSections.has(
+            getStudentSectionKey(entry.student)
+          )
+        )
+
+        if (hallEntries.length === 0) continue
+
+        const classCounts = getRoomClassSeatCounts(result)
+        const rowCounts = getRoomRowClassCounts(result)
+        const columnCounts = getRoomColumnClassCounts(result)
+
+        const edgeCandidates = getHallEntryEdgeCandidates(hallEntries)
+
+        const candidates = edgeCandidates.filter((entry) =>
+          safeAtClassroomBoundary(
+            result,
+            targetSeat,
+            entry.student,
+            restrictions
+          )
+        )
+
+        if (candidates.length === 0) continue
+
+        candidates.sort((a, b) => {
+          const scoreA = scoreAutomaticFillCandidate(
+            result,
+            targetSeat,
+            a.student,
+            classCounts,
+            rowCounts,
+            columnCounts
+          )
+
+          const scoreB = scoreAutomaticFillCandidate(
+            result,
+            targetSeat,
+            b.student,
+            classCounts,
+            rowCounts,
+            columnCounts
+          )
+
+          if (scoreA !== scoreB) return scoreB - scoreA
+          return Math.random() - 0.5
+        })
+
+        const chosen = candidates[0]
+        if (!chosen) continue
+
+        targetSeat.student = chosen.student
+
+        const hallSeat = chosen.hallResult.seats.find(
+          (seat) => seat.id === chosen.hallSeat.id
+        )
+
+        if (hallSeat) {
+          hallSeat.student = null
+        }
+
+        updateRoomDistributionAfterHallMove(
+          result,
+          chosen.student
+        )
+
+        chosen.hallResult.assignedStudents =
+          (chosen.hallResult.seats || []).filter(
+            (seat) => seat.student
+          ).length
+
+        madeProgress = true
+      }
+    }
+  })
+
+  // Keep the report metadata in sync with the actual physical seats.
+  results.forEach((result) => {
+    result.assignedStudents = (result.seats || []).filter(
+      (seat) => seat.student
+    ).length
+    result.remainingStudents = []
+  })
+
+  return results
+}
+
 // ============================================================
 // ROOM TARGETS
 // ============================================================
@@ -2208,7 +3307,32 @@ function getBalancedQuotas(classKeys, totalStudents) {
 // has enough students to fill the quota. Among those, choose the smallest
 // surplus. If no section can fill the quota, use the largest available
 // section (still requiring at least 5 students).
-function chooseBestSectionForQuota(classStudents, quota) {
+function getSectionUsageRatio(
+  sectionKey,
+  sectionUsage = {},
+  initialSectionStrengths = {}
+) {
+  const used = Math.max(
+    0,
+    Number(sectionUsage?.[sectionKey] || 0)
+  )
+
+  const initial = Math.max(
+    1,
+    Number(
+      initialSectionStrengths?.[sectionKey] || 1
+    )
+  )
+
+  return used / initial
+}
+
+function chooseBestSectionForQuota(
+  classStudents,
+  quota,
+  sectionUsage = {},
+  initialSectionStrengths = {}
+) {
   const sectionGroups = groupStudentsBySection(classStudents)
 
   const eligibleSections = Array.from(sectionGroups.entries())
@@ -2216,6 +3340,14 @@ function chooseBestSectionForQuota(classStudents, quota) {
       sectionKey,
       students: sectionStudents,
       strength: sectionStudents.length,
+      usageCount: Number(
+        sectionUsage?.[sectionKey] || 0
+      ),
+      usageRatio: getSectionUsageRatio(
+        sectionKey,
+        sectionUsage,
+        initialSectionStrengths
+      ),
     }))
     .filter((entry) => entry.strength >= 5)
 
@@ -2223,7 +3355,10 @@ function chooseBestSectionForQuota(classStudents, quota) {
     return null
   }
 
-  const target = Math.max(0, Number(quota) || 0)
+  const target = Math.max(
+    0,
+    Number(quota) || 0
+  )
 
   eligibleSections.sort((a, b) => {
     // 1. Exact quota match is always preferred.
@@ -2243,10 +3378,12 @@ function chooseBestSectionForQuota(classStudents, quota) {
     }
 
     // 3. If both can fill, prefer the smallest surplus.
-    //    If neither can fill, prefer the smallest deficit / largest section.
+    //    If neither can fill, prefer the largest remaining section.
     if (aCanFill && bCanFill) {
-      const surplusA = a.strength - target
-      const surplusB = b.strength - target
+      const surplusA =
+        a.strength - target
+      const surplusB =
+        b.strength - target
 
       if (surplusA !== surplusB) {
         return surplusA - surplusB
@@ -2257,7 +3394,20 @@ function chooseBestSectionForQuota(classStudents, quota) {
       }
     }
 
-    // 4. Stable deterministic tie-break.
+    // 4. When section suitability is otherwise equal, prefer the section
+    //    that has been used less of its original strength. This prevents
+    //    repeatedly consuming one section while leaving another section
+    //    mostly unused.
+    if (a.usageRatio !== b.usageRatio) {
+      return a.usageRatio - b.usageRatio
+    }
+
+    // 5. Stable tie-break by actual usage count.
+    if (a.usageCount !== b.usageCount) {
+      return a.usageCount - b.usageCount
+    }
+
+    // 6. Deterministic final tie-break.
     return String(a.sectionKey).localeCompare(
       String(b.sectionKey),
       undefined,
@@ -2272,10 +3422,19 @@ function chooseBestSectionForQuota(classStudents, quota) {
 // We prefer classes that have a SINGLE section capable of supplying the
 // room's balanced quota. This prevents a room from needing to split one
 // overall class across multiple sections.
-function scoreOverallClassForQuota(classStudents, quota) {
+function scoreOverallClassForQuota(
+  classKey,
+  classStudents,
+  quota,
+  sectionUsage = {},
+  initialSectionStrengths = {},
+  classUsage = {}
+) {
   const bestSection = chooseBestSectionForQuota(
     classStudents,
-    quota
+    quota,
+    sectionUsage,
+    initialSectionStrengths
   )
 
   if (!bestSection) {
@@ -2300,105 +3459,27 @@ function scoreOverallClassForQuota(classStudents, quota) {
     score += strength * 10
   }
 
+  // Prefer classes that have been used in fewer rooms so the same few
+  // overall classes do not dominate the beginning of the seating plan.
+  // This is a soft preference only; quota suitability and the existing
+  // section rules still come first.
+  const roomsAlreadyUsed = Number(
+    classUsage?.[classKey] || 0
+  )
+
+  score -= roomsAlreadyUsed * 5000
+
+  // Slight bonus for a class that has not been used in any earlier room.
+  if (roomsAlreadyUsed === 0) {
+    score += 1500
+  }
+
   // Prefer stronger overall classes as a soft tie-break.
   score += Math.min(classStudents.length, 100)
 
   return score
 }
 
-function selectRoomClasses(
-  students,
-  totalStudents,
-  minClasses = 3,
-  maxClasses = 5
-) {
-  const groups = groupStudentsByOverallClass(students)
-
-  // Only an OVERALL class with at least 5 students available can be used.
-  // Sections are combined only for checking the overall-class strength;
-  // they are NOT combined when students are actually selected for the room.
-  const eligibleEntries = Array.from(groups.entries())
-    .map(([classKey, classStudents]) => ({
-      classKey,
-      students: classStudents,
-      strength: classStudents.length,
-    }))
-    .filter((entry) => entry.strength >= 5)
-
-  if (eligibleEntries.length === 0) {
-    return {
-      classKeys: [],
-      students: [],
-    }
-  }
-
-  const roomTarget = Math.max(
-    0,
-    Number(totalStudents) || 0
-  )
-
-  const count = getRoomClassCount(
-    eligibleEntries.length,
-    roomTarget,
-    minClasses,
-    maxClasses
-  )
-
-  if (count <= 0) {
-    return {
-      classKeys: [],
-      students: [],
-    }
-  }
-
-  // Quota depends only on the NUMBER of overall classes in this room.
-  const provisionalClassKeys = eligibleEntries
-    .map((entry) => entry.classKey)
-    .sort((a, b) =>
-      String(a).localeCompare(
-        String(b),
-        undefined,
-        { numeric: true }
-      )
-    )
-
-  const provisionalKeys = provisionalClassKeys.slice(0, count)
-  const provisionalQuotas = getBalancedQuotas(
-    provisionalKeys,
-    roomTarget
-  )
-
-  // Score every overall class according to how well one of its sections can
-  // match the room's provisional balanced quota.
-  const scored = eligibleEntries
-    .map((entry) => ({
-      ...entry,
-      score: scoreOverallClassForQuota(
-        entry.students,
-        provisionalQuotas[entry.classKey] ?? Math.floor(roomTarget / count)
-      ),
-    }))
-    .sort((a, b) => {
-      if (b.score !== a.score) return b.score - a.score
-
-      if (b.strength !== a.strength) {
-        return b.strength - a.strength
-      }
-
-      return String(a.classKey).localeCompare(
-        String(b.classKey),
-        undefined,
-        { numeric: true }
-      )
-    })
-
-  const selected = scored.slice(0, count)
-
-  return {
-    classKeys: selected.map((entry) => entry.classKey),
-    students: selected.flatMap((entry) => entry.students),
-  }
-}
 
 // ============================================================
 // BALANCED CLASS DISTRIBUTION PER ROOM
@@ -2422,120 +3503,264 @@ function selectRoomClasses(
 // and Class 9's room quota is 12.
 // The room uses ONLY 9B (12), not 9A + 9B + 9C.
 // ============================================================
-function getBalancedClassDistribution(
+function getMaximumUsableSectionStrength(classStudents) {
+  const sectionGroups = groupStudentsBySection(classStudents)
+  const strengths = Array.from(sectionGroups.values())
+    .map((sectionStudents) => sectionStudents.length)
+    .filter((strength) => strength >= 5)
+
+  return strengths.length ? Math.max(...strengths) : 0
+}
+
+function buildBalancedRoomQuotaPlan(
+  classKeys,
+  overallGroups,
+  target,
+  classUsage = {},
+  sectionUsage = {},
+  initialSectionStrengths = {}
+) {
+  const keys = [...(classKeys || [])]
+  const requested = Math.max(0, Number(target) || 0)
+
+  if (!keys.length || requested <= 0) return null
+  if (requested < keys.length * 5) return null
+
+  const maximums = {}
+  for (const key of keys) {
+    const maximum = getMaximumUsableSectionStrength(
+      overallGroups.get(String(key)) || []
+    )
+    if (maximum < 5) return null
+    maximums[key] = maximum
+  }
+
+  const counts = {}
+  keys.forEach((key) => { counts[key] = 5 })
+
+  let actualTarget = keys.length * 5
+
+  while (actualTarget < requested) {
+    const currentValues = keys.map((key) => Number(counts[key] || 0))
+    const currentMinimum = Math.min(...currentValues)
+
+    const candidates = keys.filter((key) => {
+      const current = Number(counts[key] || 0)
+      if (current >= maximums[key]) return false
+      return current <= currentMinimum + 2
+    })
+
+    if (!candidates.length) break
+
+    candidates.sort((a, b) => {
+      const countDifference =
+        Number(counts[a] || 0) - Number(counts[b] || 0)
+      if (countDifference !== 0) return countDifference
+
+      const capacityDifference =
+        Number(maximums[b] || 0) - Number(maximums[a] || 0)
+      if (capacityDifference !== 0) return capacityDifference
+
+      const usageA = Number(classUsage?.[a] || 0)
+      const usageB = Number(classUsage?.[b] || 0)
+      if (usageA !== usageB) return usageA - usageB
+
+      return String(a).localeCompare(
+        String(b),
+        undefined,
+        { numeric: true }
+      )
+    })
+
+    counts[candidates[0]] += 1
+    actualTarget += 1
+  }
+
+  const values = keys.map((key) => Number(counts[key] || 0))
+  const minimum = Math.min(...values)
+  const maximum = Math.max(...values)
+  if (minimum < 5 || maximum - minimum > 3) return null
+
+  let score = 0
+  for (const key of keys) {
+    const quota = Number(counts[key] || 0)
+    const bestSection = chooseBestSectionForQuota(
+      overallGroups.get(String(key)) || [],
+      quota,
+      sectionUsage,
+      initialSectionStrengths
+    )
+
+    if (!bestSection || bestSection.strength < quota) return null
+
+    score += Number(classUsage?.[key] || 0) * 1000
+    score +=
+      getSectionUsageRatio(
+        bestSection.sectionKey,
+        sectionUsage,
+        initialSectionStrengths
+      ) * 100
+  }
+
+  return {
+    distribution: counts,
+    actualTarget,
+    score,
+  }
+}
+
+function getClassKeyCombinations(items, count) {
+  const values = [...(items || [])]
+  const output = []
+
+  function walk(startIndex, current) {
+    if (current.length === count) {
+      output.push([...current])
+      return
+    }
+
+    for (let index = startIndex; index < values.length; index += 1) {
+      current.push(values[index])
+      walk(index + 1, current)
+      current.pop()
+    }
+  }
+
+  walk(0, [])
+  return output
+}
+
+function selectRoomClasses(
   students,
   totalStudents,
-  forcedClassKeys = null
+  minClasses = 3,
+  maxClasses = 5,
+  sectionUsage = {},
+  initialSectionStrengths = {},
+  classUsage = {}
 ) {
-  const list = [...(students || [])]
-  const target = Math.min(
-    Math.max(Number(totalStudents) || 0, 0),
-    list.length
-  )
+  const groups = groupStudentsByOverallClass(students)
+  const roomTarget = Math.max(0, Number(totalStudents) || 0)
 
-  if (target <= 0 || list.length === 0) {
-    return {
-      students: [],
-      distribution: {},
-      sectionDistribution: {},
-    }
+  const eligibleEntries = Array.from(groups.entries())
+    .map(([classKey, classStudents]) => ({
+      classKey,
+      students: classStudents,
+      strength: classStudents.length,
+    }))
+    .filter((entry) => entry.strength >= 5)
+
+  if (!eligibleEntries.length || roomTarget < 5) {
+    return { classKeys: [], students: [], distribution: {} }
   }
 
-  const overallGroups = groupStudentsByOverallClass(list)
+  const maximumClassCount = Math.min(
+    maxClasses,
+    eligibleEntries.length,
+    Math.floor(roomTarget / 5)
+  )
 
-  let classKeys = Array.isArray(forcedClassKeys)
-    ? forcedClassKeys.filter((key) =>
-        overallGroups.has(String(key))
+  if (maximumClassCount <= 0) {
+    return { classKeys: [], students: [], distribution: {} }
+  }
+
+  const minimumClassCount = Math.min(minClasses, maximumClassCount)
+  const eligibleKeys = eligibleEntries.map((entry) => entry.classKey)
+  let bestPlan = null
+
+  for (
+    let classCount = maximumClassCount;
+    classCount >= minimumClassCount;
+    classCount -= 1
+  ) {
+    const combinations = getClassKeyCombinations(eligibleKeys, classCount)
+
+    for (const classKeys of combinations) {
+      const plan = buildBalancedRoomQuotaPlan(
+        classKeys,
+        groups,
+        roomTarget,
+        classUsage,
+        sectionUsage,
+        initialSectionStrengths
       )
-    : Array.from(overallGroups.keys())
-        .filter((key) => overallGroups.get(key).length >= 5)
-        .sort((a, b) =>
-          String(a).localeCompare(
-            String(b),
-            undefined,
-            { numeric: true }
-          )
+
+      if (!plan) continue
+
+      if (
+        !bestPlan ||
+        plan.actualTarget > bestPlan.actualTarget ||
+        (
+          plan.actualTarget === bestPlan.actualTarget &&
+          classKeys.length > bestPlan.classKeys.length
+        ) ||
+        (
+          plan.actualTarget === bestPlan.actualTarget &&
+          classKeys.length === bestPlan.classKeys.length &&
+          plan.score < bestPlan.score
         )
-
-  // Never use an overall class with fewer than 5 available students.
-  classKeys = classKeys.filter(
-    (key) => overallGroups.get(String(key)).length >= 5
-  )
-
-  if (classKeys.length === 0) {
-    return {
-      students: [],
-      distribution: {},
-      sectionDistribution: {},
+      ) {
+        bestPlan = {
+          classKeys,
+          distribution: plan.distribution,
+          actualTarget: plan.actualTarget,
+          score: plan.score,
+        }
+      }
     }
+
+    if (bestPlan?.actualTarget >= roomTarget) break
   }
 
-  // Keep the room at 3-5 overall classes where possible, while making sure
-  // each class can receive at least 5 students.
-  const feasibleCount = Math.min(
-    classKeys.length,
-    5,
-    Math.max(1, Math.floor(target / 5))
-  )
-
-  if (feasibleCount <= 0) {
-    return {
-      students: [],
-      distribution: {},
-      sectionDistribution: {},
-    }
+  if (!bestPlan) {
+    return { classKeys: [], students: [], distribution: {} }
   }
 
-  classKeys = classKeys.slice(0, feasibleCount)
+  return {
+    classKeys: bestPlan.classKeys,
+    students: bestPlan.classKeys.flatMap(
+      (classKey) => groups.get(String(classKey)) || []
+    ),
+    distribution: bestPlan.distribution,
+  }
+}
 
-  const distribution = getBalancedQuotas(
-    classKeys,
-    target
-  )
-
+function buildBalancedClassAllocationBlock(
+  students,
+  classKeys,
+  distribution,
+  sectionUsage = {},
+  initialSectionStrengths = {},
+  fromEnd = false
+) {
+  const overallGroups = groupStudentsByOverallClass(students)
   const selectedStudents = []
   const finalDistribution = {}
   const sectionDistribution = {}
 
-  classKeys.forEach((classKey) => {
+  for (const classKey of classKeys || []) {
     const classStudents = overallGroups.get(String(classKey)) || []
-    const quota = distribution[classKey] || 0
+    const quota = Number(distribution?.[classKey] || 0)
+    if (quota < 5) return null
 
-    // Select ONLY ONE section for this overall class in this room.
     const bestSection = chooseBestSectionForQuota(
       classStudents,
-      quota
-    )
-
-    if (!bestSection) {
-      return
-    }
-
-    // Never deliberately create a <5-student group.
-    if (bestSection.students.length < 5) {
-      return
-    }
-
-    const sectionStudents = [...bestSection.students].sort((a, b) => {
-      return (
-        Number(a.rollNumber ?? 0) -
-        Number(b.rollNumber ?? 0)
-      )
-    })
-
-    const takeCount = Math.min(
       quota,
-      sectionStudents.length
+      sectionUsage,
+      initialSectionStrengths
     )
 
-    if (takeCount < 5) {
-      return
-    }
+    if (!bestSection || bestSection.strength < quota) return null
 
-    const chosenStudents = sectionStudents.slice(
-      0,
-      takeCount
+    const sortedSectionStudents = [...bestSection.students].sort(
+      (a, b) => Number(a.rollNumber ?? 0) - Number(b.rollNumber ?? 0)
     )
+
+    const chosenStudents = fromEnd
+      ? sortedSectionStudents.slice(-quota)
+      : sortedSectionStudents.slice(0, quota)
+
+    if (chosenStudents.length !== quota) return null
 
     selectedStudents.push(...chosenStudents)
     finalDistribution[classKey] = chosenStudents.length
@@ -2544,7 +3769,14 @@ function getBalancedClassDistribution(
       studentCount: chosenStudents.length,
       availableInSection: bestSection.strength,
     }
-  })
+  }
+
+  const values = Object.values(finalDistribution).map(Number)
+  if (
+    values.length !== (classKeys || []).length ||
+    !values.length ||
+    Math.max(...values) - Math.min(...values) > 3
+  ) return null
 
   return {
     students: selectedStudents,
@@ -2553,7 +3785,97 @@ function getBalancedClassDistribution(
   }
 }
 
-// ============================================================
+function getBalancedClassDistribution(
+  students,
+  totalStudents,
+  forcedClassKeys = null,
+  sectionUsage = {},
+  initialSectionStrengths = {},
+  forcedDistribution = null
+) {
+  const list = [...(students || [])]
+  if (!list.length) {
+    return { students: [], distribution: {}, sectionDistribution: {} }
+  }
+
+  const overallGroups = groupStudentsByOverallClass(list)
+  let classKeys = Array.isArray(forcedClassKeys)
+    ? forcedClassKeys.filter((key) => overallGroups.has(String(key)))
+    : Array.from(overallGroups.keys())
+        .filter((key) => overallGroups.get(String(key))?.length >= 5)
+        .sort((a, b) =>
+          String(a).localeCompare(String(b), undefined, { numeric: true })
+        )
+
+  classKeys = classKeys.filter(
+    (key) => overallGroups.get(String(key))?.length >= 5
+  )
+
+  if (!classKeys.length) {
+    return { students: [], distribution: {}, sectionDistribution: {} }
+  }
+
+  let distribution = null
+
+  if (forcedDistribution && typeof forcedDistribution === 'object') {
+    distribution = {}
+    classKeys.forEach((key) => {
+      const quota = Number(forcedDistribution[key] || 0)
+      if (quota >= 5) distribution[key] = quota
+    })
+  } else {
+    const target = Math.min(
+      Math.max(Number(totalStudents) || 0, 0),
+      list.length
+    )
+
+    const plan = selectRoomClasses(
+      list,
+      target,
+      3,
+      5,
+      sectionUsage,
+      initialSectionStrengths,
+      {}
+    )
+
+    if (!plan.classKeys.length) {
+      return { students: [], distribution: {}, sectionDistribution: {} }
+    }
+
+    classKeys = plan.classKeys
+    distribution = plan.distribution
+  }
+
+  classKeys = classKeys.filter(
+    (key) => Number(distribution?.[key] || 0) >= 5
+  )
+
+  if (!classKeys.length) {
+    return { students: [], distribution: {}, sectionDistribution: {} }
+  }
+
+  const plannedValues = classKeys.map((key) => Number(distribution[key] || 0))
+  if (Math.max(...plannedValues) - Math.min(...plannedValues) > 3) {
+    return { students: [], distribution: {}, sectionDistribution: {} }
+  }
+
+  return (
+    buildBalancedClassAllocationBlock(
+      list,
+      classKeys,
+      distribution,
+      sectionUsage,
+      initialSectionStrengths,
+      false
+    ) || {
+      students: [],
+      distribution: {},
+      sectionDistribution: {},
+    }
+  )
+}
+
 // MANUAL DRAG / GROUP SELECTION HELPERS
 // ============================================================
 
@@ -2625,6 +3947,11 @@ function getTargetSeatGroup(result, startSeatId, count) {
 // ============================================================
 
 function SeatingArrangement({ onGoToReports }) {
+  const savedSeatingState = useMemo(
+    () => loadSavedSeatingState(),
+    []
+  )
+
   const [
     availableClasses,
     setAvailableClasses,
@@ -2633,7 +3960,9 @@ function SeatingArrangement({ onGoToReports }) {
   const [
     selectedClasses,
     setSelectedClasses,
-  ] = useState({})
+  ] = useState(
+    savedSeatingState.selectedClasses
+  )
 
   const [
     rooms,
@@ -2643,17 +3972,23 @@ function SeatingArrangement({ onGoToReports }) {
   const [
     selectedRoomIds,
     setSelectedRoomIds,
-  ] = useState([])
+  ] = useState(
+    savedSeatingState.selectedRoomIds
+  )
 
   const [
     generatedRooms,
     setGeneratedRooms,
-  ] = useState([])
+  ] = useState(
+    savedSeatingState.generatedRooms
+  )
 
   const [
     generated,
     setGenerated,
-  ] = useState(false)
+  ] = useState(
+    savedSeatingState.generated
+  )
 
   const [
     loadingRooms,
@@ -2718,6 +4053,31 @@ function SeatingArrangement({ onGoToReports }) {
       return []
     }
   }
+
+  // ==========================================================
+  // SAVE / RESTORE SEATING STATE
+  // ==========================================================
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(
+        SEATING_STATE_KEY,
+        JSON.stringify({
+          selectedClasses,
+          selectedRoomIds,
+          generatedRooms,
+          generated,
+        })
+      )
+    } catch (error) {
+      console.error("Failed to save seating state:", error)
+    }
+  }, [
+    selectedClasses,
+    selectedRoomIds,
+    generatedRooms,
+    generated,
+  ])
 
   // ==========================================================
   // LOAD CLASSES
@@ -4222,14 +5582,9 @@ function SeatingArrangement({ onGoToReports }) {
           seat.seatIndex ?? 0
         )
 
-        // Only direct horizontal neighbors on the same bench are hard
-        // conflicts. For benches with more than two seats this catches
-        // both immediate sides.
-        return (
-          Math.abs(
-            otherSeatIndex - currentSeatIndex
-          ) === 1
-        )
+        // Every other occupied seat on the SAME physical bench is a hard
+        // conflict. Adjacent benches are not a hard classroom restriction.
+        return otherSeatIndex !== currentSeatIndex
       })
     }
 
@@ -4539,44 +5894,8 @@ function removeHorizontalSameClassConflictsToUnassigned(results) {
   const removedStudents = []
   const removedIds = new Set()
 
-  // Classroom / Lab: remove the touching student from the non-3-seat
-  // middle/shorter bench whenever the other touching edge is a 3-seat bench.
-  updatedResults.forEach((result) => {
-    let safetyCounter = 0
-
-    while (safetyCounter < 1000) {
-      safetyCounter += 1
-
-      const conflicts = getHorizontalBenchBoundaryConflictPairs(result)
-      if (conflicts.length === 0) break
-
-      let changed = false
-
-      for (const conflict of conflicts) {
-        const seatToRemove = chooseClassroomBoundaryRemovalSeat(conflict)
-        if (!seatToRemove?.student) continue
-
-        const actualSeat = result.seats.find(
-          (seat) => seat.id === seatToRemove.id
-        )
-
-        if (!actualSeat?.student) continue
-
-        const studentId = getStudentId(actualSeat.student)
-
-        if (!removedIds.has(studentId)) {
-          removedIds.add(studentId)
-          removedStudents.push(actualSeat.student)
-        }
-
-        actualSeat.student = null
-        changed = true
-        break
-      }
-
-      if (!changed) break
-    }
-  })
+  // Classroom/Lab: no cross-bench removal. The hard classroom rule is
+  // enforced on the same physical bench by the placement checks.
 
   // Large Hall: only one student is removed for each direct horizontal
   // same-class conflict. Vertical neighbours are intentionally ignored.
@@ -4623,58 +5942,6 @@ function removeHorizontalSameClassConflictsToUnassigned(results) {
   }
 }
 
-function getStrictClassroomAdjacentSeats(result, targetSeat) {
-  const seats = Array.isArray(result?.seats) ? result.seats : []
-  const targetFurnitureId = String(targetSeat?.furnitureId ?? targetSeat?.id)
-  const targetIndex = Number(targetSeat?.seatIndex ?? 0)
-  const targetRow = Number(targetSeat?.row ?? 0)
-  const targetX = Number(
-    targetSeat?.physicalX ??
-      (Number(targetSeat?.x ?? 0) + targetIndex * 45)
-  )
-
-  const neighbours = []
-  const seen = new Set()
-
-  for (const seat of seats) {
-    if (!seat || seat === targetSeat || !seat.student) continue
-    if (seen.has(seat.id)) continue
-
-    const furnitureId = String(seat.furnitureId ?? seat.id)
-    const seatIndex = Number(seat.seatIndex ?? 0)
-    const row = Number(seat.row ?? 0)
-    const x = Number(
-      seat.physicalX ??
-        (Number(seat.x ?? 0) + seatIndex * 45)
-    )
-
-    // Same physical bench:
-    // EVERY other occupied seat on the same bench is a conflict candidate.
-    // This enforces the new rule for 2-seat and 3-seat benches alike.
-    if (
-      furnitureId === targetFurnitureId &&
-      seatIndex !== targetIndex
-    ) {
-      neighbours.push(seat)
-      seen.add(seat.id)
-      continue
-    }
-
-    // Adjacent benches in the same visual row. The furniture may have a
-    // gap, so use the actual rendered x-position of the seat centres rather
-    // than requiring the furniture IDs to match.
-    if (row === targetRow) {
-      const distance = Math.abs(x - targetX)
-      if (distance > 40 && distance <= 175) {
-        neighbours.push(seat)
-        seen.add(seat.id)
-      }
-    }
-  }
-
-  return neighbours
-}
-
 function getClassroomConflictPairs(result, restrictions = []) {
   const conflicts = []
   const seats = Array.isArray(result?.seats) ? result.seats : []
@@ -4705,68 +5972,6 @@ function getClassroomConflictPairs(result, restrictions = []) {
   }
 
   return conflicts
-}
-
-function getClassroomBoundaryNeighbours(result, targetSeat) {
-  return getStrictClassroomAdjacentSeats(result, targetSeat)
-}
-
-function isSafeAtClassroomBoundary(
-  result,
-  targetSeat,
-  replacementStudent,
-  restrictions = []
-) {
-  if (!replacementStudent) return false
-
-  return getClassroomBoundaryNeighbours(result, targetSeat).every((seat) => {
-    if (!seat?.student) return true
-
-    return !classesConflict(
-      replacementStudent.classKey,
-      seat.student.classKey,
-      restrictions
-    )
-  })
-}
-
-function getLargeHallSeatNeighbours(hallSeats, targetSeat) {
-  const targetRow = Number(targetSeat?.row ?? 0)
-  const targetColumn = Number(targetSeat?.column ?? 0)
-
-  return (hallSeats || []).filter((seat) => {
-    if (seat === targetSeat) return false
-
-    const row = Number(seat?.row ?? 0)
-    const column = Number(seat?.column ?? 0)
-
-    return (
-      (row === targetRow && Math.abs(column - targetColumn) === 1) ||
-      (column === targetColumn && Math.abs(row - targetRow) === 1)
-    )
-  })
-}
-
-function isSafeAtLargeHall(
-  hallResult,
-  targetSeat,
-  replacementStudent,
-  restrictions = []
-) {
-  if (!replacementStudent) return false
-
-  return getLargeHallSeatNeighbours(
-    hallResult?.seats || [],
-    targetSeat
-  ).every((seat) => {
-    if (!seat?.student) return true
-
-    return !classesConflict(
-      replacementStudent.classKey,
-      seat.student.classKey,
-      restrictions
-    )
-  })
 }
 
 function repairClassroomConflictsUsingLargeHall(
@@ -4822,7 +6027,7 @@ function repairClassroomConflictsUsingLargeHall(
               // New classroom position must be safe against BOTH
               // same-bench and cross-bench neighbours.
               if (
-                !isSafeAtClassroomBoundary(
+                !safeAtClassroomBoundary(
                   classroomResult,
                   classroomSeat,
                   hallStudent,
@@ -4835,7 +6040,7 @@ function repairClassroomConflictsUsingLargeHall(
               // The displaced classroom student must also be safe in the
               // Large Hall position after the exchange.
               if (
-                !isSafeAtLargeHall(
+                !safeAtLargeHall(
                   hallResult,
                   hallSeat,
                   classroomStudent,
@@ -4954,7 +6159,7 @@ function repairAllRemainingClassroomConflicts(
             if (sameClass(hallStudent, classroomStudent)) continue
 
             if (
-              !isSafeAtClassroomBoundary(
+              !safeAtClassroomBoundary(
                 conflict.result,
                 classroomSeat,
                 hallStudent,
@@ -4965,7 +6170,7 @@ function repairAllRemainingClassroomConflicts(
             }
 
             if (
-              !isSafeAtLargeHall(
+              !safeAtLargeHall(
                 hallResult,
                 hallSeat,
                 classroomStudent,
@@ -5008,7 +6213,7 @@ function repairAllRemainingClassroomConflicts(
             if (sameClass(sourceStudent, classroomStudent)) continue
 
             if (
-              !isSafeAtClassroomBoundary(
+              !safeAtClassroomBoundary(
                 conflict.result,
                 classroomSeat,
                 sourceStudent,
@@ -5019,7 +6224,7 @@ function repairAllRemainingClassroomConflicts(
             }
 
             if (
-              !isSafeAtClassroomBoundary(
+              !safeAtClassroomBoundary(
                 sourceResult,
                 sourceSeat,
                 classroomStudent,
@@ -5062,6 +6267,114 @@ function repairAllRemainingClassroomConflicts(
 }
 
 // ==========================================================
+function getRoomIdentity(room) {
+  return String(room?._id ?? room?.id ?? room?.name ?? '')
+}
+
+function buildLargeHallReservationPlans(rooms, students, targets) {
+  const reservations = {}
+  const globallyReservedIds = new Set()
+
+  const initialSectionStrengths = {}
+  ;(students || []).forEach((student) => {
+    const sectionKey = getStudentSectionKey(student)
+    initialSectionStrengths[sectionKey] =
+      (initialSectionStrengths[sectionKey] || 0) + 1
+  })
+
+  ;(rooms || []).forEach((room, index) => {
+    if (room?.type !== 'Large Hall') return
+
+    const roomTarget = Number(targets?.[index] || 0)
+    if (roomTarget <= 0) return
+
+    const planningPool = (students || []).filter(
+      (student) => !globallyReservedIds.has(getStudentId(student))
+    )
+
+    const minimumClasses = roomTarget >= 15 ? 3 : roomTarget >= 10 ? 2 : 1
+
+    const selection = selectRoomClasses(
+      planningPool,
+      roomTarget,
+      minimumClasses,
+      5,
+      {},
+      initialSectionStrengths,
+      {}
+    )
+
+    if (!selection.classKeys.length) return
+
+    const block = buildBalancedClassAllocationBlock(
+      planningPool,
+      selection.classKeys,
+      selection.distribution,
+      {},
+      initialSectionStrengths,
+      true
+    )
+
+    if (!block?.students?.length) return
+
+    block.students.forEach((student) => {
+      globallyReservedIds.add(getStudentId(student))
+    })
+
+    reservations[getRoomIdentity(room)] = {
+      classKeys: selection.classKeys,
+      distribution: block.distribution,
+      sectionDistribution: block.sectionDistribution,
+      students: block.students,
+    }
+  })
+
+  return { reservations, globallyReservedIds }
+}
+
+function generateBestSeatingForRoom(
+  physicalSeats,
+  students,
+  restrictions = [],
+  roomType = '',
+  targetStudents = 0
+) {
+  const desired = Math.min(
+    Number(targetStudents) || students.length || 0,
+    physicalSeats.length,
+    students.length
+  )
+
+  const attempts = roomType === 'Large Hall' ? 24 : 20
+  let bestResult = null
+  let bestAssigned = -1
+
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    const result = generateSeatingForRoom(
+      physicalSeats,
+      students,
+      restrictions,
+      roomType
+    )
+
+    const assigned = (result?.seats || []).filter(
+      (seat) => seat?.student
+    ).length
+
+    if (!bestResult || assigned > bestAssigned) {
+      bestResult = result
+      bestAssigned = assigned
+    }
+
+    if (bestAssigned >= desired) break
+  }
+
+  return bestResult || {
+    seats: physicalSeats.map((seat) => ({ ...seat, student: null })),
+    remainingStudents: students,
+  }
+}
+
   // SAVE GENERATED REPORT
   // ==========================================================
 
@@ -5189,428 +6502,633 @@ function repairAllRemainingClassroomConflicts(
   }
 
   // ==========================================================
+  // ROOM-LOCAL RECOVERY HELPERS
+  // ==========================================================
+  // IMPORTANT:
+  // Once a room receives its roll-number allocation, those students are
+  // LOCKED to that room. These helpers may rearrange those students inside
+  // the same room, but NEVER take students from another room. This keeps
+  // reports continuous while still allowing seating repairs.
+
+  function fillRoomFromOwnAllocation(
+    result,
+    candidates,
+    restrictions = []
+  ) {
+    let remaining = [...(candidates || [])]
+    let progress = true
+    let guard = 0
+
+    while (progress && remaining.length > 0 && guard < 20) {
+      guard += 1
+      progress = false
+
+      const emptySeats = (result?.seats || []).filter(
+        (seat) => !seat?.student
+      )
+
+      for (const seat of emptySeats) {
+        const safeCandidates = remaining.filter((student) =>
+          isStudentAllowedByRoomSection(result, student) &&
+          isSafeForAutomaticFill(result, seat, student, restrictions)
+        )
+
+        if (!safeCandidates.length) continue
+
+        safeCandidates.sort((a, b) => {
+          const classA = getStudentOverallClassKey(a)
+          const classB = getStudentOverallClassKey(b)
+          const counts = getRoomClassSeatCounts(result)
+          const diff =
+            Number(counts[classA] || 0) - Number(counts[classB] || 0)
+          if (diff !== 0) return diff
+          return Math.random() - 0.5
+        })
+
+        const chosen = safeCandidates[0]
+        const index = remaining.findIndex(
+          (student) => getStudentId(student) === getStudentId(chosen)
+        )
+        if (index === -1) continue
+
+        seat.student = chosen
+        remaining.splice(index, 1)
+        result.assignedStudents =
+          (result.assignedStudents || 0) + 1
+        progress = true
+      }
+    }
+
+    result.roomAllocationRemainder = remaining
+    result.remainingStudents = remaining
+    return remaining
+  }
+
+  // Return the orthogonally adjacent seats around a Large Hall seat.
+  // Large Hall uses a row/column grid, so only immediate horizontal or
+  // vertical neighbours are considered adjacency conflicts.
+  function getLargeHallSeatNeighbours(hallSeats, targetSeat) {
+    const targetRow = Number(targetSeat?.row ?? 0)
+    const targetColumn = Number(targetSeat?.column ?? 0)
+
+    return (hallSeats || []).filter((seat) => {
+      if (!seat || seat === targetSeat) return false
+
+      const row = Number(seat?.row ?? 0)
+      const column = Number(seat?.column ?? 0)
+
+      return (
+        (row === targetRow &&
+          Math.abs(column - targetColumn) === 1) ||
+        (column === targetColumn &&
+          Math.abs(row - targetRow) === 1)
+      )
+    })
+  }
+
+  function getLargeHallAllConflictPairs(result, restrictions = []) {
+    if (!result || result?.room?.type !== "Large Hall") return []
+
+    const conflicts = []
+    const seats = result.seats || []
+    const seen = new Set()
+
+    for (const seatA of seats) {
+      if (!seatA?.student) continue
+
+      const neighbours = getLargeHallSeatNeighbours(seats, seatA)
+      for (const seatB of neighbours) {
+        if (!seatB?.student) continue
+
+        const key = [String(seatA.id), String(seatB.id)].sort().join("::")
+        if (seen.has(key)) continue
+        seen.add(key)
+
+        if (
+          classesConflict(
+            seatA.student.classKey,
+            seatB.student.classKey,
+            restrictions
+          )
+        ) {
+          conflicts.push({ seatA, seatB })
+        }
+      }
+    }
+
+    return conflicts
+  }
+
+  function repairConflictsWithinRoom(result, restrictions = []) {
+    if (!result?.seats?.length) return result
+
+    const isHall = result.room?.type === "Large Hall"
+    let pass = 0
+    let changed = true
+
+    while (changed && pass < 40) {
+      pass += 1
+      changed = false
+
+      const conflicts = isHall
+        ? getLargeHallAllConflictPairs(result, restrictions)
+        : getClassroomConflictPairs(result, restrictions)
+
+      if (!conflicts.length) break
+
+      for (const conflict of conflicts) {
+        const conflictSeats = [conflict.seatA, conflict.seatB]
+        let repaired = false
+
+        for (const targetSeat of conflictSeats) {
+          if (!targetSeat?.student) continue
+
+          for (const sourceSeat of result.seats || []) {
+            if (!sourceSeat?.student) continue
+            if (sourceSeat === targetSeat) continue
+            if (sameClass(sourceSeat.student, targetSeat.student)) continue
+
+            const originalTarget = targetSeat.student
+            const originalSource = sourceSeat.student
+
+            targetSeat.student = originalSource
+            sourceSeat.student = originalTarget
+
+            const remainingConflicts = isHall
+              ? getLargeHallAllConflictPairs(result, restrictions)
+              : getClassroomConflictPairs(result, restrictions)
+
+            if (remainingConflicts.length === 0) {
+              repaired = true
+              changed = true
+              break
+            }
+
+            targetSeat.student = originalTarget
+            sourceSeat.student = originalSource
+          }
+
+          if (repaired) break
+        }
+
+        if (repaired) break
+      }
+    }
+
+    result.assignedStudents = (result.seats || []).filter(
+      (seat) => seat?.student
+    ).length
+
+    return result
+  }
+
+  function fillEmptyLargeHallFromUnassigned(
+    results,
+    unassignedStudents,
+    restrictions = []
+  ) {
+    const hall = (results || []).find(
+      (result) => result?.room?.type === "Large Hall"
+    )
+
+    if (!hall) return [...(unassignedStudents || [])]
+
+    const emptySeats = (hall.seats || []).filter(
+      (seat) => !seat?.student
+    )
+
+    if (!emptySeats.length || !unassignedStudents?.length) {
+      return [...(unassignedStudents || [])]
+    }
+
+    // If the Hall is completely empty, allocate fresh contiguous class blocks
+    // to it. This is the preferred overflow path because it preserves report
+    // ranges instead of inserting isolated students into existing rooms.
+    const hallOccupied = (hall.seats || []).some((seat) => seat?.student)
+
+    if (!hallOccupied) {
+      const target = Math.min(emptySeats.length, unassignedStudents.length)
+      const minimumClasses = target >= 15 ? 3 : target >= 10 ? 2 : 1
+
+      const selection = selectRoomClasses(
+        unassignedStudents,
+        target,
+        minimumClasses,
+        5,
+        {},
+        {},
+        {}
+      )
+
+      if (selection.classKeys.length) {
+        const block = getBalancedClassDistribution(
+          unassignedStudents,
+          target,
+          selection.classKeys,
+          {},
+          {},
+          selection.distribution
+        )
+
+        if (block.students.length) {
+          const generated = generateBestSeatingForRoom(
+            buildPhysicalSeats(hall.room),
+            block.students,
+            restrictions,
+            "Large Hall",
+            target
+          )
+
+          hall.seats = generated.seats
+          hall.classDistribution = block.distribution
+          hall.classGroup = selection.classKeys
+          hall.overallClassGroup = selection.classKeys
+          hall.sectionDistribution = block.sectionDistribution
+          hall.assignedStudents = generated.seats.filter(
+            (seat) => seat?.student
+          ).length
+          hall.roomAllocationRemainder = generated.remainingStudents || []
+          hall.remainingStudents = generated.remainingStudents || []
+
+          const assignedIds = new Set(
+            hall.seats
+              .filter((seat) => seat?.student)
+              .map((seat) => getStudentId(seat.student))
+          )
+
+          return (unassignedStudents || []).filter(
+            (student) => !assignedIds.has(getStudentId(student))
+          )
+        }
+      }
+    }
+
+    // Otherwise only use unassigned students whose section is already present
+    // in the Hall. This prevents a second section of the same overall class
+    // from being silently introduced into a room.
+    const representedSections = new Set(
+      (hall.seats || [])
+        .filter((seat) => seat?.student)
+        .map((seat) => getStudentSectionKey(seat.student))
+    )
+
+    const remaining = [...(unassignedStudents || [])]
+
+    for (const seat of emptySeats) {
+      const candidates = remaining.filter(
+        (student) =>
+          representedSections.has(getStudentSectionKey(student)) &&
+          isSafeForAutomaticFill(hall, seat, student, restrictions)
+      )
+
+      if (!candidates.length) continue
+
+      const chosen = candidates[0]
+      seat.student = chosen
+      remaining.splice(
+        remaining.findIndex(
+          (student) => getStudentId(student) === getStudentId(chosen)
+        ),
+        1
+      )
+    }
+
+    hall.assignedStudents = (hall.seats || []).filter(
+      (seat) => seat?.student
+    ).length
+
+    return remaining
+  }
+
+  // ==========================================================
   // GENERATE
   // ==========================================================
 
   function handleGenerate() {
     try {
-    if (
-      selectedRooms.length ===
-      0
-    ) {
-      alert(
-        "Please select at least one examination room."
-      )
+      if (selectedRooms.length === 0) {
+        alert("Please select at least one examination room.")
+        return
+      }
 
-      return
-    }
+      if (selectedStudents.length === 0) {
+        alert("Please select at least one class/division.")
+        return
+      }
 
-    if (
-      selectedStudents.length ===
-      0
-    ) {
-      alert(
-        "Please select at least one class/division."
-      )
+      if (capacityShortage > 0) return
 
-      return
-    }
-
-    if (
-      capacityShortage > 0
-    ) {
-      return
-    }
-
-    const seatingRestrictions =
-      getSeatingRestrictions()
-
-    const targets =
-      calculateRoomTargets(
+      const seatingRestrictions = getSeatingRestrictions()
+      const targets = calculateRoomTargets(
         selectedRooms,
         selectedStudents.length
       )
 
-    // Keep each class in one continuous roll-number block, while each room
-    // chooses 3, 4 or 5 different overall classes.
-    let remainingStudents =
-      buildContinuousRandomStudentOrder(
+      let remainingStudents = buildContinuousAllocationStudentOrder(
         selectedStudents
       )
 
-    const results = []
+      const results = []
+      const initialSectionStrengths = {}
 
-    // ========================================================
-    // FIRST PASS
-    // ========================================================
+      selectedStudents.forEach((student) => {
+        const sectionKey = getStudentSectionKey(student)
+        initialSectionStrengths[sectionKey] =
+          (initialSectionStrengths[sectionKey] || 0) + 1
+      })
 
-    selectedRooms.forEach(
-      (
-        room,
-        roomIndex
-      ) => {
-        const target =
-          targets[
-            roomIndex
-          ] || 0
+      const sectionUsage = {}
+      const classUsage = {}
 
-        const physicalSeats =
-          buildPhysicalSeats(
-            room
+      const largeHallReservationPlan =
+        buildLargeHallReservationPlans(
+          selectedRooms,
+          selectedStudents,
+          targets
+        )
+
+      const globallyReservedHallIds =
+        largeHallReservationPlan.globallyReservedIds
+
+      // ========================================================
+      // FIRST PASS: LOCK A CONTIGUOUS STUDENT BLOCK TO EACH ROOM
+      // ========================================================
+      selectedRooms.forEach((room, roomIndex) => {
+        const target = Number(targets[roomIndex] || 0)
+        const physicalSeats = buildPhysicalSeats(room)
+        const roomIdentity = getRoomIdentity(room)
+        const hallReservation =
+          largeHallReservationPlan.reservations[roomIdentity] || null
+        const isLargeHall = room?.type === "Large Hall"
+
+        let allocationPool
+
+        if (isLargeHall && hallReservation) {
+          allocationPool = hallReservation.students
+        } else {
+          allocationPool = remainingStudents.filter(
+            (student) =>
+              !globallyReservedHallIds.has(getStudentId(student))
           )
+        }
 
-        // Pick up to 5 DIFFERENT overall classes for this room.
-        // 12A and 12B are treated as the same overall class 12.
-        const roomClassSelection =
-          selectRoomClasses(
-            remainingStudents,
+        const minimumClasses =
+          target >= 15 ? 3 : target >= 10 ? 2 : 1
+
+        let roomClassSelection
+
+        if (isLargeHall && hallReservation) {
+          roomClassSelection = {
+            classKeys: hallReservation.classKeys,
+            distribution: hallReservation.distribution,
+            students: hallReservation.students,
+          }
+        } else {
+          roomClassSelection = selectRoomClasses(
+            allocationPool,
             target,
-            3,
-            5
+            minimumClasses,
+            5,
+            sectionUsage,
+            initialSectionStrengths,
+            classUsage
           )
+        }
 
-        const allowedClasses =
-          new Set(
+        let balancedRoom = {
+          students: [],
+          distribution: {},
+          sectionDistribution: {},
+        }
+
+        if (roomClassSelection.classKeys.length) {
+          const allowedClasses = new Set(
             roomClassSelection.classKeys
           )
 
-        const roomCandidateStudents =
-          remainingStudents.filter((student) =>
-            allowedClasses.has(
-              getStudentOverallClassKey(student)
-            )
-          )
+          const roomCandidateStudents =
+            isLargeHall && hallReservation
+              ? hallReservation.students
+              : allocationPool.filter((student) =>
+                  allowedClasses.has(
+                    getStudentOverallClassKey(student)
+                  )
+                )
 
-        // Split this room's target as evenly as possible among its
-        // selected 3-5 OVERALL classes. Because room classes are selected
-        // only when they have at least 5 available students, this prevents
-        // tiny groups such as 1/2/3 from being created.
-        const balancedRoom =
-          getBalancedClassDistribution(
+          balancedRoom = getBalancedClassDistribution(
             roomCandidateStudents,
             target,
-            roomClassSelection.classKeys
+            roomClassSelection.classKeys,
+            sectionUsage,
+            initialSectionStrengths,
+            roomClassSelection.distribution
+          )
+        }
+
+        // If a very small room cannot support 3 classes, fall back to the
+        // exact students available for that room instead of abandoning them.
+        if (!balancedRoom.students.length && target > 0) {
+          const fallbackCount = Math.min(
+            target,
+            physicalSeats.length,
+            allocationPool.length
           )
 
-        const roomStudents =
-          balancedRoom.students
+          const fallbackStudents = allocationPool.slice(0, fallbackCount)
+          if (fallbackStudents.length) {
+            balancedRoom = {
+              students: fallbackStudents,
+              distribution: fallbackStudents.reduce((acc, student) => {
+                const key = getStudentOverallClassKey(student)
+                acc[key] = (acc[key] || 0) + 1
+                return acc
+              }, {}),
+              sectionDistribution: {},
+            }
 
-        const result =
-          generateSeatingForRoom(
-            physicalSeats,
-            roomStudents,
-            seatingRestrictions,
-            room.type
-          )
-
-        const assignedIds =
-          new Set(
-            result.seats
-              .filter(
-                (seat) =>
-                  seat.student
+            Object.keys(balancedRoom.distribution).forEach((classKey) => {
+              const section = fallbackStudents.find(
+                (student) =>
+                  getStudentOverallClassKey(student) === classKey
               )
-              .map(
-                (seat) =>
-                  seat.student.id
-              )
-          )
+              if (section) {
+                balancedRoom.sectionDistribution[classKey] = {
+                  sectionKey: getStudentSectionKey(section),
+                  studentCount: balancedRoom.distribution[classKey],
+                  availableInSection: balancedRoom.distribution[classKey],
+                }
+              }
+            })
+          }
+        }
 
-        const assignedStudents =
-          assignedIds.size
+        const roomStudents = balancedRoom.students
+
+        const result = generateBestSeatingForRoom(
+          physicalSeats,
+          roomStudents,
+          seatingRestrictions,
+          room.type,
+          target
+        )
+
+        const assignedIds = new Set(
+          (result.seats || [])
+            .filter((seat) => seat?.student)
+            .map((seat) => getStudentId(seat.student))
+        )
+
+        const roomRemainder = (result.remainingStudents || []).filter(
+          (student) => !assignedIds.has(getStudentId(student))
+        )
+
+        const classesUsedInThisRoom = new Set()
+        ;(result.seats || []).forEach((seat) => {
+          if (!seat?.student) return
+          const sectionKey = getStudentSectionKey(seat.student)
+          sectionUsage[sectionKey] =
+            (sectionUsage[sectionKey] || 0) + 1
+          classesUsedInThisRoom.add(
+            getStudentOverallClassKey(seat.student)
+          )
+        })
+
+        classesUsedInThisRoom.forEach((classKey) => {
+          classUsage[classKey] = (classUsage[classKey] || 0) + 1
+        })
 
         results.push({
           room,
           seats: result.seats,
           targetStudents: target,
-          classDistribution:
-            balancedRoom.distribution,
-          classGroup:
-            roomClassSelection.classKeys,
-          overallClassGroup:
-            roomClassSelection.classKeys,
+          classDistribution: balancedRoom.distribution,
+          classGroup: roomClassSelection.classKeys,
+          overallClassGroup: roomClassSelection.classKeys,
           sectionDistribution:
             balancedRoom.sectionDistribution || {},
-          assignedStudents,
-          remainingStudents:
-            result.remainingStudents,
+          assignedStudents: assignedIds.size,
+          roomAllocationStudents: roomStudents,
+          roomAllocationRemainder: roomRemainder,
+          remainingStudents: roomRemainder,
         })
 
-        // Remove only students actually assigned to this room.
-        remainingStudents =
-          remainingStudents.filter(
-            (student) =>
-              !assignedIds.has(
-                student.id
-              )
-          )
-      }
-    )
+        // Only remove students actually allocated to this room. Unseated
+        // students stay attached to THIS room and cannot leak into another
+        // room's roll block.
+        remainingStudents = remainingStudents.filter(
+          (student) => !assignedIds.has(getStudentId(student))
+        )
 
-    // ========================================================
-    // SECOND PASS
-    // ========================================================
+        // Also remove the complete locked block from the global pool when it
+        // was assigned to this room. This prevents later rooms from reusing
+        // the same roll block.
+        const allocatedIds = new Set(
+          roomStudents.map((student) => getStudentId(student))
+        )
+        remainingStudents = remainingStudents.filter(
+          (student) => !allocatedIds.has(getStudentId(student))
+        )
+      })
 
-    if (
-      remainingStudents.length >
-      0
-    ) {
-      let madeProgress =
-        true
+      // ========================================================
+      // ROOM-LOCAL RECOVERY ONLY
+      // ========================================================
+      // Fill unseated students back into empty seats of THE SAME ROOM.
+      // This improves occupancy without ever fragmenting report ranges.
+      results.forEach((result) => {
+        fillRoomFromOwnAllocation(
+          result,
+          result.roomAllocationRemainder || [],
+          seatingRestrictions
+        )
 
-      while (
-        remainingStudents.length >
-          0 &&
-        madeProgress
-      ) {
-        madeProgress =
-          false
+        repairConflictsWithinRoom(
+          result,
+          seatingRestrictions
+        )
 
-        for (
-          let roomIndex = 0;
-          roomIndex <
-            results.length &&
-          remainingStudents.length >
-            0;
-          roomIndex++
-        ) {
-          const result =
-            results[
-              roomIndex
-            ]
+        // A repair can occasionally move a student into a seat but leave a
+        // safe empty seat behind. Try the room-local remainder once more.
+        fillRoomFromOwnAllocation(
+          result,
+          result.roomAllocationRemainder || [],
+          seatingRestrictions
+        )
+      })
 
-          const emptySeats =
-            result.seats.filter(
-              (seat) =>
-                !seat.student
-            )
+      // ========================================================
+      // FINAL UNASSIGNED = STUDENTS NOT PRESENT IN ANY SEAT
+      // ========================================================
+      let assignedStudentIds = new Set(
+        results.flatMap((result) =>
+          (result.seats || [])
+            .filter((seat) => seat?.student)
+            .map((seat) => getStudentId(seat.student))
+        )
+      )
 
-          if (
-            emptySeats.length ===
-            0
-          ) {
-            continue
-          }
+      let unassignedStudents = selectedStudents.filter(
+        (student) => !assignedStudentIds.has(getStudentId(student))
+      )
 
-          for (
-            const seat of
-            emptySeats
-          ) {
-            if (
-              remainingStudents.length ===
-              0
-            ) {
-              break
-            }
+      // ========================================================
+      // LARGE HALL OVERFLOW RESERVOIR
+      // ========================================================
+      // When the Hall is still empty, use it for the remaining students as a
+      // NEW locked block rather than sprinkling individual students into
+      // existing classrooms. This both fills the Hall and preserves reports.
+      unassignedStudents = fillEmptyLargeHallFromUnassigned(
+        results,
+        unassignedStudents,
+        seatingRestrictions
+      )
 
-            // Keep this room within its balanced class quota.
-            const classCounts = {}
+      // ========================================================
+      // PRIORITY FILL: FIRST 3 CLASSROOM/LAB ROOMS
+      // ========================================================
+      // If the first few small rooms still have safe empty seats while the
+      // Large Hall contains students, use the Hall as the donor reservoir.
+      // Only safe students are moved, and Hall transfers use roll-block edges
+      // so the final reports remain grouped as clean ranges.
+      fillEmptySmallRoomSeatsFromLargeHall(
+        results,
+        seatingRestrictions,
+        3
+      )
 
-            result.seats.forEach((existingSeat) => {
-              if (!existingSeat.student) return
+      results.forEach((result) => {
+        repairConflictsWithinRoom(result, seatingRestrictions)
+      })
 
-              const classNumber =
-                getClassNumber(existingSeat.student.classKey) ??
-                getClassNumber(existingSeat.student.classNumber)
+      assignedStudentIds = new Set(
+        results.flatMap((result) =>
+          (result.seats || [])
+            .filter((seat) => seat?.student)
+            .map((seat) => getStudentId(seat.student))
+        )
+      )
 
-              const classKey =
-                classNumber !== null
-                  ? String(classNumber)
-                  : String(
-                      existingSeat.student.classKey ||
-                      existingSeat.student.classNumber ||
-                      "unknown"
-                    )
+      unassignedStudents = selectedStudents.filter(
+        (student) => !assignedStudentIds.has(getStudentId(student))
+      )
 
-              classCounts[classKey] =
-                (classCounts[classKey] || 0) + 1
-            })
+      results.forEach((result) => {
+        result.assignedStudents = (result.seats || []).filter(
+          (seat) => seat?.student
+        ).length
+        result.remainingStudents = []
+        delete result.roomAllocationStudents
+        delete result.roomAllocationRemainder
+      })
 
-            const quota = result.classDistribution || {}
-
-            const eligibleStudents = remainingStudents.filter((student) => {
-              const classNumber =
-                getClassNumber(student.classKey) ??
-                getClassNumber(student.classNumber)
-
-              const classKey =
-                classNumber !== null
-                  ? String(classNumber)
-                  : String(
-                      student.classKey ||
-                      student.classNumber ||
-                      "unknown"
-                    )
-
-              // Only the overall classes originally selected for this room
-              // are allowed. Sections of other overall classes are rejected.
-              if (
-                !Object.prototype.hasOwnProperty.call(
-                  quota,
-                  classKey
-                )
-              ) {
-                return false
-              }
-
-              // IMPORTANT: this room uses ONLY ONE SECTION of each overall
-              // class. Do not fill the remaining quota with another section
-              // of the same class.
-              const selectedSection =
-                result.sectionDistribution?.[classKey]?.sectionKey
-
-              if (selectedSection) {
-                if (
-                  getStudentSectionKey(student) !==
-                  selectedSection
-                ) {
-                  return false
-                }
-              }
-
-              // Also respect this room's balanced quota.
-              if (
-                (classCounts[classKey] || 0) >=
-                quota[classKey]
-              ) {
-                return false
-              }
-
-              return true
-            })
-
-            if (eligibleStudents.length === 0) {
-              continue
-            }
-
-            const compatibleIndex =
-              findCompatibleStudentIndex(
-                eligibleStudents,
-                seat,
-                result.seats,
-                seatingRestrictions
-              )
-
-            if (
-              compatibleIndex ===
-              -1
-            ) {
-              continue
-            }
-
-            const student =
-              eligibleStudents[
-                compatibleIndex
-              ]
-
-            const studentIndex =
-              remainingStudents.findIndex(
-                (candidate) =>
-                  getStudentId(candidate) ===
-                  getStudentId(student)
-              )
-
-            if (studentIndex === -1) {
-              continue
-            }
-
-            seat.student =
-              student
-
-            remainingStudents.splice(
-              studentIndex,
-              1
-            )
-
-            result.assignedStudents +=
-              1
-
-            madeProgress =
-              true
-          }
-        }
-      }
-    }
-
-    // ========================================================
-    // HARD RULE: REMOVE HORIZONTAL SAME-CLASS CONFLICTS
-    // ========================================================
-    // Classroom/Lab: keep 3-seat bench end students untouched and
-    // move only the touching student from the other/middle bench.
-    // Large Hall: move only one student from each direct horizontal conflict.
-
-    const boundaryRepair =
-      removeHorizontalSameClassConflictsToUnassigned(results)
-
-    const boundaryUnassignedStudents =
-      boundaryRepair.removedStudents
-
-    const repairedResults =
-      boundaryRepair.results
-
-    repairedResults.forEach((result) => {
-      result.remainingStudents = []
-    })
-
-    results.length = 0
-    repairedResults.forEach((result) => results.push(result))
-
-    remainingStudents = [
-      ...remainingStudents,
-      ...boundaryUnassignedStudents,
-    ]
-
-    // Keep the unassigned list unique.
-    const uniqueUnassigned = []
-    const uniqueUnassignedIds = new Set()
-
-    remainingStudents.forEach((student) => {
-      const studentId = getStudentId(student)
-      if (uniqueUnassignedIds.has(studentId)) return
-      uniqueUnassignedIds.add(studentId)
-      uniqueUnassigned.push(student)
-    })
-
-    remainingStudents = uniqueUnassigned
-
-    // ========================================================
-    // FINAL UNASSIGNED
-    // ========================================================
-
-    if (
-      remainingStudents.length >
-      0
-    ) {
-      if (
-        results.length >
-        0
-      ) {
-        results[
-          results.length - 1
-        ].remainingStudents =
-          remainingStudents
-      }
-    }
-
-    // ========================================================
-    // SAVE FOR REPORTS PAGE
-    // ========================================================
-
-    saveGeneratedReport(
-      results,
-      remainingStudents
-    )
-
-    setGeneratedRooms(
-      results
-    )
-
-    setGenerated(
-      true
-    )
+      saveGeneratedReport(results, unassignedStudents)
+      setGeneratedRooms(results)
+      setGenerated(true)
     } catch (error) {
       console.error("Seating generation failed:", error)
-      alert(`Seating generation failed: ${error?.message || "Unknown error"}`)
+      alert(
+        `Seating generation failed: ${error?.message || "Unknown error"}`
+      )
     }
   }
 
@@ -7058,8 +8576,33 @@ function repairAllRemainingClassroomConflicts(
               EACH ROOM
           ================================================== */}
 
-          {generatedRooms.map(
-            (result) => {
+          {[...generatedRooms]
+            .sort((a, b) => {
+              const order = {
+               Classroom: 1,
+               Lab: 2,
+               "Large Hall": 3,
+          }
+
+              const typeA =
+                order[a?.room?.type] ?? 99
+
+              const typeB =
+                order[b?.room?.type] ?? 99
+
+              if (typeA !== typeB) {
+                return typeA - typeB
+        }
+
+              return String(a?.room?.name || "").localeCompare(
+                String(b?.room?.name || ""),
+                undefined,
+                { numeric: true }
+              )
+            })
+            .map(
+              (result) => {
+            
 
               const room =
                 result.room
