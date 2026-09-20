@@ -2853,7 +2853,8 @@ function generateBestSeatingForRoom(
 function tryRecoverOneGlobalStudentIntoRoom(
   result,
   globalStudents,
-  restrictions = []
+  restrictions = [],
+  maxSpread = 3
 ) {
   if (!result || !Array.isArray(globalStudents) || globalStudents.length === 0) {
     return false
@@ -2929,7 +2930,8 @@ function tryRecoverOneGlobalStudentIntoRoom(
 function recoverExistingRoomBlocksFromGlobalRemaining(
   results,
   globalStudents,
-  restrictions = []
+  restrictions = [],
+  maxSpread = 3
 ) {
   let remaining = [...(globalStudents || [])]
   let madeProgress = true
@@ -2947,7 +2949,8 @@ function recoverExistingRoomBlocksFromGlobalRemaining(
         const moved = tryRecoverOneGlobalStudentIntoRoom(
           result,
           remaining,
-          restrictions
+          restrictions,
+          maxSpread
         )
 
         if (!moved) break
@@ -2977,7 +2980,8 @@ function findBestGlobalBatchForHall(
   hallResult,
   globalStudents,
   restrictions = [],
-  minimumBatch = 5
+  minimumBatch = 5,
+  maxSpread = 3
 ) {
   if (!hallResult || !Array.isArray(globalStudents)) return null
 
@@ -3032,7 +3036,7 @@ function findBestGlobalBatchForHall(
         ? Math.max(...values) - Math.min(...values)
         : 0
 
-      if (spread > 3) continue
+      if (spread > maxSpread) continue
 
       // Existing class: the batch must extend the current room block.
       if (Object.prototype.hasOwnProperty.call(roomClasses, classKey)) {
@@ -3077,7 +3081,8 @@ function findBestGlobalBatchForHall(
 function recoverGlobalRemainingIntoLargeHall(
   results,
   globalStudents,
-  restrictions = []
+  restrictions = [],
+  maxSpread = 3
 ) {
   let remaining = [...(globalStudents || [])]
 
@@ -3101,7 +3106,8 @@ function recoverGlobalRemainingIntoLargeHall(
         const moved = tryRecoverOneGlobalStudentIntoRoom(
           hall,
           remaining,
-          restrictions
+          restrictions,
+          maxSpread
         )
 
         if (!moved) break
@@ -3135,7 +3141,8 @@ function recoverGlobalRemainingIntoLargeHall(
           hall,
           remaining,
           restrictions,
-          5
+          5,
+          maxSpread
         )
 
         if (!candidate) break
@@ -4989,6 +4996,108 @@ function normalizeRoomToContinuousAllocation(result) {
   rebuildRoomAllocationMetadata(result)
 
   return released
+}
+
+
+// ============================================================
+// FINAL CONTIGUOUS BLOCK REDISTRIBUTION
+// ============================================================
+// The allocation counts per room are already valid at this point.
+// This helper keeps those exact counts/capacities but redistributes the
+// actual roll numbers sequentially across the rooms for each class+section.
+// That guarantees that every room receives one true contiguous roll block
+// instead of accidentally keeping holes such as 9211-9213 + 9215-9218.
+// Physical seating is randomized again within the already-approved seats.
+function redistributeStudentsIntoContiguousRoomBlocks(results) {
+  if (!Array.isArray(results) || results.length === 0) return results
+
+  const groups = new Map()
+
+  results.forEach((result, roomIndex) => {
+    ;(result?.seats || []).forEach((seat) => {
+      if (!seat?.student) return
+
+      const classKey = getStudentOverallClassKey(seat.student)
+      const sectionKey = getStudentSectionKey(seat.student)
+      const groupKey = `${classKey}::${sectionKey}`
+
+      if (!groups.has(groupKey)) {
+        groups.set(groupKey, {
+          classKey,
+          sectionKey,
+          studentsById: new Map(),
+          rooms: [],
+        })
+      }
+
+      const group = groups.get(groupKey)
+      const studentId = getStudentId(seat.student)
+      group.studentsById.set(studentId, seat.student)
+
+      let roomEntry = group.rooms.find(
+        (entry) => entry.result === result
+      )
+
+      if (!roomEntry) {
+        roomEntry = {
+          result,
+          roomIndex,
+          seats: [],
+          minRoll: Number.POSITIVE_INFINITY,
+          roomName: String(result?.room?.name || ""),
+        }
+        group.rooms.push(roomEntry)
+      }
+
+      roomEntry.seats.push(seat)
+      roomEntry.minRoll = Math.min(
+        roomEntry.minRoll,
+        Number(seat.student.rollNumber || 0)
+      )
+    })
+  })
+
+  groups.forEach((group) => {
+    const students = [...group.studentsById.values()].sort(
+      (a, b) =>
+        Number(a?.rollNumber || 0) -
+        Number(b?.rollNumber || 0)
+    )
+
+    const rooms = [...group.rooms].sort((a, b) => {
+      if (a.minRoll !== b.minRoll) {
+        return a.minRoll - b.minRoll
+      }
+
+      if (a.roomIndex !== b.roomIndex) {
+        return a.roomIndex - b.roomIndex
+      }
+
+      return a.roomName.localeCompare(b.roomName)
+    })
+
+    let cursor = 0
+
+    rooms.forEach((roomEntry) => {
+      const count = roomEntry.seats.length
+      const block = students.slice(cursor, cursor + count)
+      cursor += count
+
+      // Randomize physical seat placement while keeping the membership block
+      // itself contiguous by roll number.
+      const shuffledBlock = shuffleArray(block)
+
+      roomEntry.seats.forEach((seat, index) => {
+        seat.student = shuffledBlock[index] || null
+      })
+    })
+  })
+
+  ;(results || []).forEach((result) => {
+    rebuildRoomAllocationMetadata(result)
+  })
+
+  return results
 }
 
 function normalizeAllRoomAllocationsToContinuousBlocks(results) {
@@ -8209,6 +8318,101 @@ function repairAllRemainingClassroomConflicts(
       if (afterAssigned <= beforeAssigned) break
     }
 
+    // ========================================================
+    // EMERGENCY HIGH-COVERAGE RECOVERY
+    // ========================================================
+    // The normal recovery keeps room class counts within a very tight spread
+    // of 3. That is useful for balancing, but it can leave valid students
+    // unassigned when a room has spare seats and one class is only one/few
+    // students below its next contiguous roll.
+    //
+    // At this late stage, maximize seated coverage while still preserving
+    // the actual hard rules: one section per overall class per room, maximum
+    // five overall classes, contiguous roll extensions, and safe physical
+    // seating. A slightly wider class-count spread is allowed ONLY here.
+    // This does not alter the report format or the continuous-block rule.
+    for (let emergencyPass = 0; emergencyPass < 3; emergencyPass += 1) {
+      const beforeEmergency = results.reduce(
+        (sum, result) =>
+          sum +
+          (result?.seats || []).filter((seat) => seat?.student).length,
+        0
+      )
+
+      const emergencyAssignedIds = new Set(
+        results.flatMap((result) =>
+          (result?.seats || [])
+            .filter((seat) => seat?.student)
+            .map((seat) => getStudentId(seat.student))
+        )
+      )
+
+      let emergencyRemaining = selectedStudents.filter(
+        (student) => !emergencyAssignedIds.has(getStudentId(student))
+      )
+
+      emergencyRemaining =
+        recoverExistingRoomBlocksFromGlobalRemaining(
+          results,
+          emergencyRemaining,
+          seatingRestrictions,
+          5
+        )
+
+      emergencyRemaining =
+        recoverGlobalRemainingIntoLargeHall(
+          results,
+          emergencyRemaining,
+          seatingRestrictions,
+          5
+        )
+
+      fillEmptySmallRoomSeatsFromLargeHall(
+        results,
+        seatingRestrictions
+      )
+
+      results.forEach((result) => {
+        const allocated = (result?.seats || [])
+          .filter((seat) => seat?.student)
+          .map((seat) => seat.student)
+
+        result.allocatedStudents = [...allocated]
+
+        const repacked = generateBestSeatingForRoom(
+          buildPhysicalSeats(result.room),
+          allocated,
+          seatingRestrictions,
+          result.room.type,
+          180
+        )
+
+        result.seats = repacked.seats
+        result.remainingStudents = repacked.remainingStudents || []
+        result.assignedStudents = (result.seats || []).filter(
+          (seat) => seat?.student
+        ).length
+      })
+
+      repairSeatingConflictsInPlace(
+        results,
+        seatingRestrictions
+      )
+
+      const afterEmergency = results.reduce(
+        (sum, result) =>
+          sum +
+          (result?.seats || []).filter((seat) => seat?.student).length,
+        0
+      )
+
+      if (afterEmergency <= beforeEmergency) break
+    }
+
+    // Reassign actual roll numbers within the already-approved per-room class/section counts.
+    // This is membership-only and does not alter room capacities or class/section counts.
+    redistributeStudentsIntoContiguousRoomBlocks(results)
+
     // Final authoritative normalization. At this point it is followed by a
     // small recovery pass as well, so students released by this normalization
     // are not silently lost from the arrangement.
@@ -8250,6 +8454,50 @@ function repairAllRemainingClassroomConflicts(
       // guaranteed contiguous.
       normalizeAllRoomAllocationsToContinuousBlocks(results)
     }
+
+    // One last coverage pass after the authoritative normalization. This is
+    // intentionally wider than the normal <=3 balance rule, because by this
+    // point every other recovery avenue has been exhausted. It only extends
+    // existing contiguous blocks or adds valid 5+ blocks to the Large Hall.
+    {
+      const finalRecoveryAssignedIds = new Set(
+        results.flatMap((result) =>
+          (result?.seats || [])
+            .filter((seat) => seat?.student)
+            .map((seat) => getStudentId(seat.student))
+        )
+      )
+
+      let finalRecoveryPool = selectedStudents.filter(
+        (student) => !finalRecoveryAssignedIds.has(getStudentId(student))
+      )
+
+      finalRecoveryPool =
+        recoverExistingRoomBlocksFromGlobalRemaining(
+          results,
+          finalRecoveryPool,
+          seatingRestrictions,
+          5
+        )
+
+      finalRecoveryPool =
+        recoverGlobalRemainingIntoLargeHall(
+          results,
+          finalRecoveryPool,
+          seatingRestrictions,
+          5
+        )
+
+      fillEmptySmallRoomSeatsFromLargeHall(
+        results,
+        seatingRestrictions
+      )
+
+      normalizeAllRoomAllocationsToContinuousBlocks(results)
+    }
+
+    // Last hard guarantee: each class+section block in each room is contiguous.
+    redistributeStudentsIntoContiguousRoomBlocks(results)
 
     const finalAssignedIds = new Set(
       results.flatMap((result) =>
