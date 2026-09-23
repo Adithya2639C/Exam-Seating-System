@@ -264,86 +264,7 @@ function App() {
   // CLOUD WORKSPACE HELPERS
   // =========================================================
 
-  async function applyWorkspaceToLocalState(workspace) {
-    const safeWorkspace =
-      workspace &&
-      typeof workspace === "object" &&
-      !Array.isArray(workspace)
-        ? workspace
-        : {}
-
-    writeWorkspaceSnapshot(
-      safeWorkspace
-    )
-
-    const savedSettings =
-      localStorage.getItem(
-        SETTINGS_KEY
-      )
-
-    if (savedSettings) {
-      try {
-        const parsedSettings =
-          JSON.parse(savedSettings)
-
-        setSettings({
-          ...DEFAULT_SETTINGS,
-          ...(parsedSettings || {}),
-        })
-      } catch (error) {
-        console.error(
-          "Failed to apply workspace settings:",
-          error
-        )
-
-        setSettings(
-          DEFAULT_SETTINGS
-        )
-      }
-    } else {
-      setSettings(
-        DEFAULT_SETTINGS
-      )
-    }
-
-    const savedRestrictions =
-      localStorage.getItem(
-        "seatingRestrictions"
-      )
-
-    if (savedRestrictions) {
-      try {
-        const parsedRestrictions =
-          JSON.parse(savedRestrictions)
-
-        setRestrictions(
-          Array.isArray(parsedRestrictions)
-            ? parsedRestrictions
-            : []
-        )
-      } catch (error) {
-        console.error(
-          "Failed to apply workspace restrictions:",
-          error
-        )
-
-        setRestrictions([])
-      }
-    } else {
-      setRestrictions([])
-    }
-
-    lastWorkspaceFingerprintRef.current =
-      workspaceFingerprint(
-        readWorkspaceSnapshot()
-      )
-
-    return safeWorkspace
-  }
-
-  async function hydrateWorkspace(
-    googleCredential
-  ) {
+  async function hydrateWorkspace(googleCredential) {
     const response = await fetch(
       `${API_BASE_URL}/account/workspace`,
       {
@@ -354,8 +275,7 @@ function App() {
       }
     )
 
-    const data =
-      await response.json()
+    const data = await response.json()
 
     if (!response.ok) {
       throw new Error(
@@ -364,20 +284,27 @@ function App() {
       )
     }
 
+    // Existing account workspace OR a workspace created
+    // from the school default.
     if (
-      data?.exists &&
-      data?.data !== null &&
-      data?.data !== undefined
+      data.data !== null &&
+      data.data !== undefined
     ) {
-      return applyWorkspaceToLocalState(
+      writeWorkspaceSnapshot(
         data.data
       )
+
+      lastWorkspaceFingerprintRef.current =
+        workspaceFingerprint(
+          readWorkspaceSnapshot()
+        )
+
+      return data.data
     }
 
-    // No account workspace and no school default exist yet.
-    // The current school data on this device becomes the one-time school
-    // starting point. This should be done from the device containing the
-    // school's current data.
+    // No workspace and no school default exist yet.
+    // The current school data on this device becomes
+    // the one-time school starting data.
     const currentSnapshot =
       readWorkspaceSnapshot()
 
@@ -386,10 +313,15 @@ function App() {
         `${API_BASE_URL}/account/workspace/initialize`,
         {
           method: "POST",
+
           headers: {
-            "Content-Type": "application/json",
-            Authorization: `Bearer ${googleCredential}`,
+            "Content-Type":
+              "application/json",
+
+            Authorization:
+              `Bearer ${googleCredential}`,
           },
+
           body: JSON.stringify({
             data: currentSnapshot,
           }),
@@ -406,24 +338,47 @@ function App() {
       )
     }
 
-    return applyWorkspaceToLocalState(
+    writeWorkspaceSnapshot(
       bootstrapData.data || {}
     )
+
+    lastWorkspaceFingerprintRef.current =
+      workspaceFingerprint(
+        readWorkspaceSnapshot()
+      )
+
+    return bootstrapData.data || {}
   }
 
-  async function saveWorkspaceToCloud(force = false) {
-    if (!currentUser) return false
+  async function saveWorkspaceToCloud(
+    force = false
+  ) {
+    if (!currentUser) {
+      return false
+    }
 
     const googleCredential =
-      localStorage.getItem("googleCredential")
+      localStorage.getItem(
+        "googleCredential"
+      )
 
-    if (!googleCredential) return false
+    if (!googleCredential) {
+      return false
+    }
 
-    if (workspaceSyncRunningRef.current) return false
+    if (
+      workspaceSyncRunningRef.current
+    ) {
+      return false
+    }
 
-    const snapshot = readWorkspaceSnapshot()
+    const snapshot =
+      readWorkspaceSnapshot()
+
     const fingerprint =
-      workspaceFingerprint(snapshot)
+      workspaceFingerprint(
+        snapshot
+      )
 
     if (
       !force &&
@@ -433,22 +388,29 @@ function App() {
       return true
     }
 
-    workspaceSyncRunningRef.current = true
+    workspaceSyncRunningRef.current =
+      true
 
     try {
-      const response = await fetch(
-        `${API_BASE_URL}/account/workspace`,
-        {
-          method: "PUT",
-          headers: {
-            "Content-Type": "application/json",
-            Authorization: `Bearer ${googleCredential}`,
-          },
-          body: JSON.stringify({
-            data: snapshot,
-          }),
-        }
-      )
+      const response =
+        await fetch(
+          `${API_BASE_URL}/account/workspace`,
+          {
+            method: "PUT",
+
+            headers: {
+              "Content-Type":
+                "application/json",
+
+              Authorization:
+                `Bearer ${googleCredential}`,
+            },
+
+            body: JSON.stringify({
+              data: snapshot,
+            }),
+          }
+        )
 
       const data =
         await response.json()
@@ -462,7 +424,9 @@ function App() {
 
       lastWorkspaceFingerprintRef.current =
         fingerprint
+
       setWorkspaceSyncError("")
+
       return true
     } catch (error) {
       console.error(
@@ -477,7 +441,8 @@ function App() {
 
       return false
     } finally {
-      workspaceSyncRunningRef.current = false
+      workspaceSyncRunningRef.current =
+        false
     }
   }
 
