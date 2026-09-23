@@ -59,7 +59,21 @@ function App() {
   // LOGIN STATE
   // =========================================================
 
-  const [isLoggedIn, setIsLoggedIn] = useState(false)
+  const [isLoggedIn, setIsLoggedIn] = useState(() => {
+    return localStorage.getItem("examSystemLoggedIn") === "true"
+  })
+
+  const [currentUser, setCurrentUser] = useState(() => {
+    try {
+      const saved = localStorage.getItem("examSystemUser")
+      return saved ? JSON.parse(saved) : null
+    } catch (error) {
+      console.error("Failed to load saved account details:", error)
+      return null
+    }
+  })
+
+  const [accountMenuOpen, setAccountMenuOpen] = useState(false)
 
   // =========================================================
   // CURRENT PAGE
@@ -242,7 +256,9 @@ function App() {
         JSON.stringify(data.user)
       )
 
+      setCurrentUser(data.user || null)
       setIsLoggedIn(true)
+      setAccountMenuOpen(false)
       setPage("dashboard")
     } catch (error) {
       console.error(
@@ -274,6 +290,8 @@ function App() {
       "examSystemUser"
     )
 
+    setCurrentUser(null)
+    setAccountMenuOpen(false)
     setIsLoggedIn(false)
     setPage("dashboard")
     setSidebarOpen(false)
@@ -488,6 +506,36 @@ function App() {
     )
   }
 
+  const displayUserName =
+    currentUser?.name ||
+    currentUser?.fullName ||
+    currentUser?.given_name ||
+    currentUser?.email?.split("@")[0] ||
+    "Administrator"
+
+  const displayUserEmail =
+    currentUser?.email ||
+    "Admin account"
+
+  const displayUserInitial =
+    displayUserName.trim().charAt(0).toUpperCase() ||
+    "A"
+
+  const displayUserPicture =
+    currentUser?.picture ||
+    currentUser?.photoURL ||
+    currentUser?.avatar ||
+    currentUser?.image ||
+    null
+
+  function getGreeting() {
+    const hour = new Date().getHours()
+
+    if (hour < 12) return "Good morning"
+    if (hour < 17) return "Good afternoon"
+    return "Good evening"
+  }
+
   // =========================================================
   // LOGIN SCREEN
   // =========================================================
@@ -515,7 +563,7 @@ function App() {
         <div className="mb-8">
 
           <h2 className="text-3xl font-bold text-slate-900 dark-text">
-            Good morning, Administrator 👋
+            {getGreeting()}, {displayUserName} 👋
           </h2>
 
           <p className="mt-2 text-slate-500 dark-muted">
@@ -1500,46 +1548,167 @@ function App() {
 
         </div>
 
-        <div className="
-          flex
-          items-center
-          gap-3
-        ">
+        <div className="relative">
 
-          <div className="
-            w-9
-            h-9
-            rounded-full
-            bg-blue-600
-            text-white
-            flex
-            items-center
-            justify-center
-            font-semibold
-          ">
-            A
-          </div>
+          <button
+            type="button"
+            onClick={() =>
+              setAccountMenuOpen((open) => !open)
+            }
+            className="
+              flex
+              items-center
+              gap-3
+              rounded-xl
+              px-2
+              py-1.5
+              hover:bg-slate-100
+              transition
+              dark:hover:bg-slate-800
+            "
+            aria-label="Open account details"
+            aria-expanded={accountMenuOpen}
+          >
 
-          <div className="hidden sm:block">
+            {displayUserPicture ? (
+              <img
+                src={displayUserPicture}
+                alt={displayUserName}
+                className="
+                  w-9
+                  h-9
+                  rounded-full
+                  object-cover
+                  border
+                  border-slate-200
+                "
+                referrerPolicy="no-referrer"
+              />
+            ) : (
+              <div className="
+                w-9
+                h-9
+                rounded-full
+                bg-blue-600
+                text-white
+                flex
+                items-center
+                justify-center
+                font-semibold
+              ">
+                {displayUserInitial}
+              </div>
+            )}
 
-            <p className="
-              text-sm
-              font-semibold
-              text-slate-800
-              dark-text
-            ">
-              Administrator
-            </p>
+            <div className="hidden sm:block text-left">
 
-            <p className="
-              text-xs
-              text-slate-500
-              dark-muted
-            ">
-              Admin
-            </p>
+              <p className="
+                text-sm
+                font-semibold
+                text-slate-800
+                dark-text
+                max-w-40
+                truncate
+              ">
+                {displayUserName}
+              </p>
 
-          </div>
+              <p className="
+                text-xs
+                text-slate-500
+                dark-muted
+                max-w-40
+                truncate
+              ">
+                {displayUserEmail}
+              </p>
+
+            </div>
+
+            <span className="text-slate-400 text-xs">▾</span>
+
+          </button>
+
+          {accountMenuOpen && (
+            <>
+              <div
+                className="fixed inset-0 z-40"
+                onClick={() => setAccountMenuOpen(false)}
+              />
+
+              <div className="
+                absolute
+                right-0
+                top-14
+                z-50
+                w-72
+                rounded-2xl
+                border
+                border-slate-200
+                bg-white
+                shadow-xl
+                p-4
+                dark-card
+              ">
+
+                <div className="flex items-center gap-3 pb-4 border-b border-slate-200">
+
+                  {displayUserPicture ? (
+                    <img
+                      src={displayUserPicture}
+                      alt={displayUserName}
+                      className="w-12 h-12 rounded-full object-cover border border-slate-200"
+                      referrerPolicy="no-referrer"
+                    />
+                  ) : (
+                    <div className="w-12 h-12 rounded-full bg-blue-600 text-white flex items-center justify-center font-semibold text-lg">
+                      {displayUserInitial}
+                    </div>
+                  )}
+
+                  <div className="min-w-0">
+                    <p className="font-semibold text-slate-900 dark-text truncate">
+                      {displayUserName}
+                    </p>
+                    <p className="text-sm text-slate-500 dark-muted truncate">
+                      {displayUserEmail}
+                    </p>
+                  </div>
+
+                </div>
+
+                <div className="py-3">
+                  <p className="text-xs font-semibold uppercase tracking-wide text-slate-400">
+                    Account details
+                  </p>
+                  <p className="mt-2 text-sm text-slate-600 dark-muted">
+                    Signed in with Google
+                  </p>
+                </div>
+
+                <button
+                  type="button"
+                  onClick={handleLogout}
+                  className="
+                    w-full
+                    rounded-xl
+                    border
+                    border-red-200
+                    px-4
+                    py-2.5
+                    text-sm
+                    font-semibold
+                    text-red-600
+                    hover:bg-red-50
+                    text-left
+                  "
+                >
+                  Log out
+                </button>
+
+              </div>
+            </>
+          )}
 
         </div>
 
