@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react"
+import { useEffect, useMemo, useRef, useState } from "react"
 import { GoogleOAuthProvider } from "@react-oauth/google"
 
 import Login from "./pages/Login"
@@ -25,6 +25,48 @@ const API_BASE_URL =
   window.location.hostname === "127.0.0.1"
     ? "http://localhost:5000/api"
     : "https://smart-exam-backend-dg42.onrender.com/api"
+
+const WORKSPACE_KEYS = [
+  "examClasses",
+  "seatingRestrictions",
+  "generatedSeatingReport",
+  "invigilatorTeachers",
+  "invigilationExamDays",
+  "invigilationDutySchedule",
+  "smartExamSeatingArrangementState",
+  "schoolSettings",
+]
+
+function readWorkspaceSnapshot() {
+  const snapshot = {}
+
+  WORKSPACE_KEYS.forEach((key) => {
+    const value = localStorage.getItem(key)
+
+    if (value !== null) {
+      snapshot[key] = value
+    }
+  })
+
+  return snapshot
+}
+
+function writeWorkspaceSnapshot(snapshot) {
+  WORKSPACE_KEYS.forEach((key) => {
+    if (
+      snapshot &&
+      Object.prototype.hasOwnProperty.call(snapshot, key)
+    ) {
+      localStorage.setItem(key, snapshot[key])
+    } else {
+      localStorage.removeItem(key)
+    }
+  })
+}
+
+function workspaceFingerprint(snapshot) {
+  return JSON.stringify(snapshot || {})
+}
 
 function App() {
   // =========================================================
@@ -74,6 +116,19 @@ function App() {
   })
 
   const [accountMenuOpen, setAccountMenuOpen] = useState(false)
+
+  // =========================================================
+  // CLOUD WORKSPACE SYNC
+  // =========================================================
+
+  const [workspaceLoading, setWorkspaceLoading] = useState(
+    () => localStorage.getItem("examSystemLoggedIn") === "true"
+  )
+
+  const [workspaceSyncError, setWorkspaceSyncError] = useState("")
+
+  const lastWorkspaceFingerprintRef = useRef("")
+  const workspaceSyncRunningRef = useRef(false)
 
   // =========================================================
   // CURRENT PAGE
@@ -206,19 +261,258 @@ function App() {
   }, [restrictions])
 
   // =========================================================
+  // CLOUD WORKSPACE HELPERS
+  // =========================================================
+
+  async function applyWorkspaceToLocalState(workspace) {
+    const safeWorkspace =
+      workspace &&
+      typeof workspace === "object" &&
+      !Array.isArray(workspace)
+        ? workspace
+        : {}
+
+    writeWorkspaceSnapshot(
+      safeWorkspace
+    )
+
+    const savedSettings =
+      localStorage.getItem(
+        SETTINGS_KEY
+      )
+
+    if (savedSettings) {
+      try {
+        const parsedSettings =
+          JSON.parse(savedSettings)
+
+        setSettings({
+          ...DEFAULT_SETTINGS,
+          ...(parsedSettings || {}),
+        })
+      } catch (error) {
+        console.error(
+          "Failed to apply workspace settings:",
+          error
+        )
+
+        setSettings(
+          DEFAULT_SETTINGS
+        )
+      }
+    } else {
+      setSettings(
+        DEFAULT_SETTINGS
+      )
+    }
+
+    const savedRestrictions =
+      localStorage.getItem(
+        "seatingRestrictions"
+      )
+
+    if (savedRestrictions) {
+      try {
+        const parsedRestrictions =
+          JSON.parse(savedRestrictions)
+
+        setRestrictions(
+          Array.isArray(parsedRestrictions)
+            ? parsedRestrictions
+            : []
+        )
+      } catch (error) {
+        console.error(
+          "Failed to apply workspace restrictions:",
+          error
+        )
+
+        setRestrictions([])
+      }
+    } else {
+      setRestrictions([])
+    }
+
+    lastWorkspaceFingerprintRef.current =
+      workspaceFingerprint(
+        readWorkspaceSnapshot()
+      )
+
+    return safeWorkspace
+  }
+
+  async function hydrateWorkspace(
+    googleCredential
+  ) {
+    const response = await fetch(
+      `${API_BASE_URL}/account/workspace`,
+      {
+        method: "GET",
+        headers: {
+          Authorization: `Bearer ${googleCredential}`,
+        },
+      }
+    )
+
+    const data =
+      await response.json()
+
+    if (!response.ok) {
+      throw new Error(
+        data?.message ||
+        "Failed to load your saved application data."
+      )
+    }
+
+    if (
+      data?.exists &&
+      data?.data !== null &&
+      data?.data !== undefined
+    ) {
+      return applyWorkspaceToLocalState(
+        data.data
+      )
+    }
+
+    // No account workspace and no school default exist yet.
+    // The current school data on this device becomes the one-time school
+    // starting point. This should be done from the device containing the
+    // school's current data.
+    const currentSnapshot =
+      readWorkspaceSnapshot()
+
+    const bootstrapResponse =
+      await fetch(
+        `${API_BASE_URL}/account/workspace/initialize`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${googleCredential}`,
+          },
+          body: JSON.stringify({
+            data: currentSnapshot,
+          }),
+        }
+      )
+
+    const bootstrapData =
+      await bootstrapResponse.json()
+
+    if (!bootstrapResponse.ok) {
+      throw new Error(
+        bootstrapData?.message ||
+        "Failed to initialize your application data."
+      )
+    }
+
+    return applyWorkspaceToLocalState(
+      bootstrapData.data || {}
+    )
+  }
+
+  async function saveWorkspaceToCloud(force = false) {
+    if (!currentUser) return false
+
+    const googleCredential =
+      localStorage.getItem("googleCredential")
+
+    if (!googleCredential) return false
+
+    if (workspaceSyncRunningRef.current) return false
+
+    const snapshot = readWorkspaceSnapshot()
+    const fingerprint =
+      workspaceFingerprint(snapshot)
+
+    if (
+      !force &&
+      fingerprint ===
+        lastWorkspaceFingerprintRef.current
+    ) {
+      return true
+    }
+
+    workspaceSyncRunningRef.current = true
+
+    try {
+      const response = await fetch(
+        `${API_BASE_URL}/account/workspace`,
+        {
+          method: "PUT",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${googleCredential}`,
+          },
+          body: JSON.stringify({
+            data: snapshot,
+          }),
+        }
+      )
+
+      const data =
+        await response.json()
+
+      if (!response.ok) {
+        throw new Error(
+          data?.message ||
+          "Failed to save your application data."
+        )
+      }
+
+      lastWorkspaceFingerprintRef.current =
+        fingerprint
+      setWorkspaceSyncError("")
+      return true
+    } catch (error) {
+      console.error(
+        "Workspace sync error:",
+        error
+      )
+
+      setWorkspaceSyncError(
+        error.message ||
+        "Application data could not be synced."
+      )
+
+      return false
+    } finally {
+      workspaceSyncRunningRef.current = false
+    }
+  }
+
+  // =========================================================
   // LOGIN
   // =========================================================
 
   async function handleLogin(googleCredential) {
     try {
+      setWorkspaceSyncError("")
+      setWorkspaceLoading(true)
+
       if (!googleCredential) {
+        const demoUser = {
+          sub: "demo-account",
+          name: "Administrator",
+          email: "demo@example.com",
+        }
+
         localStorage.setItem(
           "examSystemLoggedIn",
           "true"
         )
 
+        localStorage.setItem(
+          "examSystemUser",
+          JSON.stringify(demoUser)
+        )
+
+        setCurrentUser(demoUser)
         setIsLoggedIn(true)
+        setAccountMenuOpen(false)
         setPage("dashboard")
+        lastWorkspaceFingerprintRef.current =
+          workspaceFingerprint(readWorkspaceSnapshot())
         return
       }
 
@@ -257,6 +551,11 @@ function App() {
       )
 
       setCurrentUser(data.user || null)
+
+      await hydrateWorkspace(
+        googleCredential
+      )
+
       setIsLoggedIn(true)
       setAccountMenuOpen(false)
       setPage("dashboard")
@@ -266,18 +565,129 @@ function App() {
         error
       )
 
+      localStorage.removeItem(
+        "examSystemLoggedIn"
+      )
+
+      localStorage.removeItem(
+        "googleCredential"
+      )
+
+      setIsLoggedIn(false)
+      setWorkspaceSyncError(
+        error.message ||
+        "Login failed. Please try again."
+      )
+
       alert(
         error.message ||
         "Login failed. Please try again."
       )
+    } finally {
+      setWorkspaceLoading(false)
     }
   }
+
+  // =========================================================
+  // RESTORE / SYNC AN EXISTING SESSION
+  // =========================================================
+
+  useEffect(() => {
+    if (!isLoggedIn || !currentUser) {
+      if (!isLoggedIn) {
+        setWorkspaceLoading(false)
+      }
+      return
+    }
+
+    const googleCredential =
+      localStorage.getItem("googleCredential")
+
+    if (!googleCredential) {
+      setWorkspaceLoading(false)
+      return
+    }
+
+    let cancelled = false
+
+    async function restoreWorkspace() {
+      try {
+        setWorkspaceLoading(true)
+        await hydrateWorkspace(
+          googleCredential
+        )
+      } catch (error) {
+        console.error(
+          "Failed to restore cloud workspace:",
+          error
+        )
+
+        if (!cancelled) {
+          localStorage.removeItem(
+            "examSystemLoggedIn"
+          )
+          localStorage.removeItem(
+            "googleCredential"
+          )
+          setIsLoggedIn(false)
+          setCurrentUser(null)
+          setWorkspaceSyncError(
+            error.message ||
+            "Your saved application data could not be loaded."
+          )
+        }
+      } finally {
+        if (!cancelled) {
+          setWorkspaceLoading(false)
+        }
+      }
+    }
+
+    restoreWorkspace()
+
+    return () => {
+      cancelled = true
+    }
+    // Run once for a session restored from local storage.
+    // Explicit logins call hydrateWorkspace directly.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  // =========================================================
+  // CONTINUOUS CLOUD SAVE
+  // =========================================================
+
+  useEffect(() => {
+    if (
+      !isLoggedIn ||
+      !currentUser ||
+      workspaceLoading
+    ) {
+      return undefined
+    }
+
+    const timer = window.setInterval(() => {
+      saveWorkspaceToCloud()
+    }, 2500)
+
+    return () =>
+      window.clearInterval(timer)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [
+    isLoggedIn,
+    currentUser,
+    workspaceLoading,
+  ])
 
   // =========================================================
   // LOGOUT
   // =========================================================
 
-  function handleLogout() {
+  async function handleLogout() {
+    if (currentUser) {
+      await saveWorkspaceToCloud(true)
+    }
+
     localStorage.removeItem(
       "examSystemLoggedIn"
     )
@@ -295,6 +705,7 @@ function App() {
     setIsLoggedIn(false)
     setPage("dashboard")
     setSidebarOpen(false)
+    setWorkspaceLoading(false)
   }
 
   // =========================================================
@@ -472,38 +883,99 @@ function App() {
     alert("Settings saved successfully.")
   }
 
-  function resetApplicationData() {
+  async function resetApplicationData() {
     const confirmed =
       window.confirm(
-        "This will remove saved classes, seating restrictions, generated seating reports, and invigilator data. Continue?"
+        "This will clear this Google account's saved application data so you can start a new seating setup. Continue?"
       )
 
     if (!confirmed) {
       return
     }
 
-    const keysToRemove = [
-      "examClasses",
-      "seatingRestrictions",
-      "generatedSeatingReport",
-      "invigilatorTeachers",
-      "invigilationExamDays",
-      "invigilationDutySchedule",
-      "examSystemLoggedIn",
-    ]
+    try {
+      const googleCredential =
+        localStorage.getItem(
+          "googleCredential"
+        )
 
-    keysToRemove.forEach(
-      (key) =>
-        localStorage.removeItem(key)
-    )
+      if (!googleCredential || !currentUser) {
+        throw new Error(
+          "Your account session is not available. Please sign in again."
+        )
+      }
 
-    setRestrictions([])
-    setClassOne("")
-    setClassTwo("")
+      const response = await fetch(
+        `${API_BASE_URL}/account/workspace`,
+        {
+          method: "DELETE",
+          headers: {
+            Authorization: `Bearer ${googleCredential}`,
+          },
+        }
+      )
 
-    alert(
-      "Application data has been cleared. Refresh the page to start fresh."
-    )
+      const data =
+        await response.json()
+
+      if (!response.ok) {
+        throw new Error(
+          data?.message ||
+          "Failed to clear your saved application data."
+        )
+      }
+
+      const savedSchoolSettings =
+        localStorage.getItem(
+          SETTINGS_KEY
+        )
+
+      WORKSPACE_KEYS.forEach((key) => {
+        if (key !== SETTINGS_KEY) {
+          localStorage.removeItem(key)
+        }
+      })
+
+      if (savedSchoolSettings !== null) {
+        localStorage.setItem(
+          SETTINGS_KEY,
+          savedSchoolSettings
+        )
+      }
+
+      setRestrictions([])
+      setClassOne("")
+      setClassTwo("")
+
+      lastWorkspaceFingerprintRef.current =
+        workspaceFingerprint(
+          readWorkspaceSnapshot()
+        )
+
+      // Keep school settings while clearing the examination workspace.
+      await saveWorkspaceToCloud(true)
+
+      setWorkspaceSyncError("")
+
+      alert(
+        "This Google account's saved application data has been cleared. The school settings were kept, and you can now enter a new seating setup."
+      )
+    } catch (error) {
+      console.error(
+        "Clear application data error:",
+        error
+      )
+
+      setWorkspaceSyncError(
+        error.message ||
+        "Failed to clear saved application data."
+      )
+
+      alert(
+        error.message ||
+        "Failed to clear saved application data."
+      )
+    }
   }
 
   const displayUserName =
@@ -1130,8 +1602,9 @@ function App() {
             text-slate-500
             dark-muted
           ">
-            This information is saved locally on
-            this browser.
+            This information is saved to your
+            Google account so it is available on your
+            other devices.
           </p>
 
           <div className="
@@ -1466,9 +1939,10 @@ function App() {
           text-sm
           text-blue-700
         ">
-          Settings are stored locally in your
-          browser, so they remain available when you
-          restart the local website.
+          Your application data is saved to your Google
+          account and is available across devices. The
+          first login of a new account receives the
+          school's current starting data.
         </div>
 
       </div>
@@ -1479,6 +1953,19 @@ function App() {
   // MAIN APPLICATION
   // =========================================================
 
+  if (workspaceLoading) {
+    return (
+      <div className="min-h-screen bg-slate-50 flex items-center justify-center p-6">
+        <div className="bg-white rounded-2xl border border-slate-200 shadow-sm px-8 py-7 text-center">
+          <div className="text-2xl font-bold text-slate-900">Loading your saved data…</div>
+          <p className="mt-2 text-sm text-slate-500">
+            Connecting your Google account to its application workspace.
+          </p>
+        </div>
+      </div>
+    )
+  }
+
   return (
     <div
       className="
@@ -1487,6 +1974,12 @@ function App() {
         app-shell
       "
     >
+
+      {workspaceSyncError && (
+        <div className="fixed bottom-4 left-4 right-4 sm:left-auto sm:right-4 z-[100] max-w-md rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800 shadow-lg">
+          {workspaceSyncError}
+        </div>
+      )}
 
       {/* HEADER */}
 

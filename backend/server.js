@@ -6,6 +6,8 @@ const cors = require("cors")
 
 const Exam = require("./models/Exam")
 const Room = require("./models/Room")
+const Workspace = require("./models/Workspace")
+const SchoolDefault = require("./models/SchoolDefault")
 const requireAuth = require("./middleware/auth")
 
 const app = express()
@@ -57,6 +59,7 @@ app.get("/api/health", (req, res) => {
         : "disconnected",
   })
 })
+
 // ============================================================
 // AUTHENTICATED USER
 // ============================================================
@@ -72,15 +75,406 @@ app.get("/api/auth/me", requireAuth, (req, res) => {
     },
   })
 })
+
+// ============================================================
+// ACCOUNT WORKSPACE
+// ============================================================
+// Each Google account has its own workspace.
+//
+// FIRST account ever:
+//   Current browser data is sent by the frontend.
+//   That becomes the School Default.
+//   That same data is saved to the first account.
+//
+// NEW account:
+//   Gets a copy of the School Default.
+//
+// EXISTING account:
+//   Gets its own previously saved workspace.
+//
+// CLEAR DATA:
+//   Only clears the current account.
+//   It does NOT delete School Default.
+// ============================================================
+
+// ------------------------------------------------------------
+// GET CURRENT ACCOUNT WORKSPACE
+// ------------------------------------------------------------
+
+app.get(
+  "/api/account/workspace",
+  requireAuth,
+  async (req, res) => {
+    try {
+      let workspace =
+        await Workspace.findOne({
+          user: req.user._id,
+        })
+
+      // --------------------------------------------------------
+      // Existing account workspace
+      // --------------------------------------------------------
+
+      if (workspace) {
+        return res.json({
+          exists: true,
+          source:
+            workspace.clearedAt
+              ? "account-cleared"
+              : "account",
+          data: workspace.data || {},
+          clearedAt:
+            workspace.clearedAt || null,
+          updatedAt:
+            workspace.updatedAt,
+        })
+      }
+
+      // --------------------------------------------------------
+      // New account + School Default already exists
+      // --------------------------------------------------------
+
+      const schoolDefault =
+        await SchoolDefault.findOne({
+          key: "school-default",
+        })
+
+      if (schoolDefault) {
+        workspace =
+          await Workspace.findOneAndUpdate(
+            {
+              user: req.user._id,
+            },
+            {
+              $setOnInsert: {
+                user: req.user._id,
+                data:
+                  schoolDefault.data || {},
+                clearedAt: null,
+              },
+            },
+            {
+              new: true,
+              upsert: true,
+              setDefaultsOnInsert: true,
+            }
+          )
+
+        return res.json({
+          exists: true,
+          source: "school-default",
+          data:
+            workspace.data || {},
+          clearedAt: null,
+          updatedAt:
+            workspace.updatedAt,
+        })
+      }
+
+      // --------------------------------------------------------
+      // No account workspace and no school default yet
+      // Frontend must send the current school's data
+      // to /initialize.
+      // --------------------------------------------------------
+
+      return res.json({
+        exists: false,
+        source: "none",
+        data: null,
+        clearedAt: null,
+      })
+    } catch (error) {
+      console.error(
+        "GET ACCOUNT WORKSPACE ERROR:",
+        error
+      )
+
+      res.status(500).json({
+        message:
+          "Failed to load account workspace",
+      })
+    }
+  }
+)
+
+// ------------------------------------------------------------
+// INITIALIZE CURRENT ACCOUNT
+// ------------------------------------------------------------
+// This is used when there is no workspace yet.
+//
+// IMPORTANT:
+// The first initialization creates the School Default.
+//
+// After School Default exists, every new account gets
+// the School Default instead of creating a new default.
+// ------------------------------------------------------------
+
+app.post(
+  "/api/account/workspace/initialize",
+  requireAuth,
+  async (req, res) => {
+    try {
+      // --------------------------------------------------------
+      // If account already has a workspace, never overwrite it.
+      // --------------------------------------------------------
+
+      const existingWorkspace =
+        await Workspace.findOne({
+          user: req.user._id,
+        })
+
+      if (existingWorkspace) {
+        return res.json({
+          success: true,
+          source:
+            existingWorkspace.clearedAt
+              ? "account-cleared"
+              : "account",
+          data:
+            existingWorkspace.data || {},
+        })
+      }
+
+      // --------------------------------------------------------
+      // Check whether School Default already exists.
+      // --------------------------------------------------------
+
+      let schoolDefault =
+        await SchoolDefault.findOne({
+          key: "school-default",
+        })
+
+      // --------------------------------------------------------
+      // FIRST USER:
+      // Current school data becomes School Default.
+      // --------------------------------------------------------
+
+      if (!schoolDefault) {
+        const incomingData =
+          req.body?.data
+
+        if (
+          !incomingData ||
+          typeof incomingData !==
+            "object" ||
+          Array.isArray(incomingData)
+        ) {
+          return res.status(400).json({
+            message:
+              "Initial workspace data is required.",
+          })
+        }
+
+        schoolDefault =
+          await SchoolDefault.findOneAndUpdate(
+            {
+              key: "school-default",
+            },
+            {
+              $setOnInsert: {
+                key: "school-default",
+                data: incomingData,
+              },
+            },
+            {
+              new: true,
+              upsert: true,
+              setDefaultsOnInsert: true,
+            }
+          )
+      }
+
+      // --------------------------------------------------------
+      // Create account workspace from School Default.
+      // --------------------------------------------------------
+
+      const workspace =
+        await Workspace.findOneAndUpdate(
+          {
+            user: req.user._id,
+          },
+          {
+            $setOnInsert: {
+              user: req.user._id,
+              data:
+                schoolDefault.data || {},
+              clearedAt: null,
+            },
+          },
+          {
+            new: true,
+            upsert: true,
+            setDefaultsOnInsert: true,
+          }
+        )
+
+      res.json({
+        success: true,
+        source:
+          schoolDefault
+            ? "school-default"
+            : "school-default-created",
+        data:
+          workspace.data || {},
+      })
+    } catch (error) {
+      console.error(
+        "INITIALIZE ACCOUNT WORKSPACE ERROR:",
+        error
+      )
+
+      res.status(500).json({
+        message:
+          "Failed to initialize account workspace",
+        error:
+          error.message,
+      })
+    }
+  }
+)
+
+// ------------------------------------------------------------
+// SAVE CURRENT ACCOUNT WORKSPACE
+// ------------------------------------------------------------
+
+app.put(
+  "/api/account/workspace",
+  requireAuth,
+  async (req, res) => {
+    try {
+      const incomingData =
+        req.body?.data
+
+      if (
+        !incomingData ||
+        typeof incomingData !==
+          "object" ||
+        Array.isArray(incomingData)
+      ) {
+        return res.status(400).json({
+          message:
+            "Workspace data must be an object.",
+        })
+      }
+
+      const workspace =
+        await Workspace.findOneAndUpdate(
+          {
+            user: req.user._id,
+          },
+          {
+            $set: {
+              data: incomingData,
+              clearedAt: null,
+            },
+
+            $setOnInsert: {
+              user: req.user._id,
+            },
+          },
+          {
+            new: true,
+            upsert: true,
+            setDefaultsOnInsert: true,
+          }
+        )
+
+      res.json({
+        success: true,
+        data:
+          workspace.data || {},
+        updatedAt:
+          workspace.updatedAt,
+      })
+    } catch (error) {
+      console.error(
+        "SAVE ACCOUNT WORKSPACE ERROR:",
+        error
+      )
+
+      res.status(500).json({
+        message:
+          "Failed to save account workspace",
+        error:
+          error.message,
+      })
+    }
+  }
+)
+
+// ------------------------------------------------------------
+// CLEAR CURRENT ACCOUNT WORKSPACE
+// ------------------------------------------------------------
+// We DO NOT delete the workspace document.
+//
+// Instead we mark it cleared and store an empty object.
+// This prevents the School Default from being automatically
+// copied back into this account after the user intentionally
+// cleared the data.
+// ------------------------------------------------------------
+
+app.delete(
+  "/api/account/workspace",
+  requireAuth,
+  async (req, res) => {
+    try {
+      const workspace =
+        await Workspace.findOneAndUpdate(
+          {
+            user: req.user._id,
+          },
+          {
+            $set: {
+              data: {},
+              clearedAt:
+                new Date(),
+            },
+
+            $setOnInsert: {
+              user: req.user._id,
+            },
+          },
+          {
+            new: true,
+            upsert: true,
+            setDefaultsOnInsert: true,
+          }
+        )
+
+      res.json({
+        success: true,
+        message:
+          "This account's workspace has been cleared.",
+        data: {},
+        clearedAt:
+          workspace.clearedAt,
+      })
+    } catch (error) {
+      console.error(
+        "CLEAR ACCOUNT WORKSPACE ERROR:",
+        error
+      )
+
+      res.status(500).json({
+        message:
+          "Failed to clear account workspace",
+        error:
+          error.message,
+      })
+    }
+  }
+)
+
 // ============================================================
 // GET ALL ROOMS
 // ============================================================
 
 app.get("/api/rooms", async (req, res) => {
   try {
-    const rooms = await Room.find().sort({
-      createdAt: -1,
-    })
+    const rooms =
+      await Room.find().sort({
+        createdAt: -1,
+      })
 
     res.json(rooms)
   } catch (error) {
@@ -90,7 +484,8 @@ app.get("/api/rooms", async (req, res) => {
     )
 
     res.status(500).json({
-      message: "Failed to load rooms",
+      message:
+        "Failed to load rooms",
     })
   }
 })
@@ -101,7 +496,8 @@ app.get("/api/rooms", async (req, res) => {
 
 app.post("/api/rooms", async (req, res) => {
   try {
-    const room = new Room(req.body)
+    const room =
+      new Room(req.body)
 
     const savedRoom =
       await room.save()
