@@ -5169,12 +5169,10 @@ function SeatingArrangement({ onGoToReports }) {
   // ==========================================================
 
   const [manualDragMode, setManualDragMode] = useState(false)
-  const [dragGroupSize, setDragGroupSize] = useState(1)
   const [selectedDragIds, setSelectedDragIds] = useState([])
   const [draggingIds, setDraggingIds] = useState([])
   const [manualTarget, setManualTarget] = useState(null)
   const [manualMessage, setManualMessage] = useState("")
-  const [autoScrollEnabled, setAutoScrollEnabled] = useState(true)
 
   // ----------------------------------------------------------
   // MOVE SELECTED STUDENTS TO UNASSIGNED / DESTINATION ROOM
@@ -5567,12 +5565,6 @@ function SeatingArrangement({ onGoToReports }) {
     setManualMessage(message)
   }
 
-  function handleDragGroupSizeChange(value) {
-    const next = Math.max(1, Number(value) || 1)
-    setDragGroupSize(next)
-    resetManualSelection()
-  }
-
   function toggleManualStudent(student) {
     if (!manualDragMode || !student) return
 
@@ -5580,26 +5572,18 @@ function SeatingArrangement({ onGoToReports }) {
 
     setSelectedDragIds((previous) => {
       if (previous.includes(id)) {
-        const next =
-          previous.filter(
-            (item) => item !== id
-          )
+        const next = previous.filter(
+          (item) => item !== id
+        )
 
         setManualMessage(
           next.length === 0
             ? ""
-            : `Selected ${next.length} / ${dragGroupSize}.`
+            : `Selected ${next.length} student${next.length === 1 ? "" : "s"}.`
         )
 
         setUnassignedMessage("")
         return next
-      }
-
-      if (previous.length >= dragGroupSize) {
-        setManualMessage(
-          `You can select exactly ${dragGroupSize} student${dragGroupSize === 1 ? "" : "s"} for this move.`
-        )
-        return previous
       }
 
       const previousAssigned =
@@ -5644,14 +5628,15 @@ function SeatingArrangement({ onGoToReports }) {
         return previous
       }
 
-      const next = [...previous, id]
+      const next = [
+        ...previous,
+        id,
+      ]
 
       setManualMessage(
-        next.length === dragGroupSize
-          ? previousHasUnassigned || !newIsAssigned
-            ? `Ready. Choose a destination room for the ${dragGroupSize} selected unassigned student${dragGroupSize === 1 ? "" : "s"}.`
-            : `Ready. Drag any selected student to the target seat group.`
-          : `Select ${dragGroupSize - next.length} more student${dragGroupSize - next.length === 1 ? "" : "s"}.`
+        previousHasUnassigned || !newIsAssigned
+          ? `Selected ${next.length} unassigned student${next.length === 1 ? "" : "s"}. Choose a destination room when you are ready.`
+          : `Selected ${next.length} student${next.length === 1 ? "" : "s"}. Drag any selected student to move the group.`
       )
 
       setUnassignedMessage("")
@@ -5694,13 +5679,6 @@ function SeatingArrangement({ onGoToReports }) {
     if (selectedDragIds.length === 0) {
       setUnassignedMessage(
         "Select the students you want to move first."
-      )
-      return
-    }
-
-    if (selectedDragIds.length !== dragGroupSize) {
-      setUnassignedMessage(
-        `Select exactly ${dragGroupSize} students first.`
       )
       return
     }
@@ -5857,16 +5835,6 @@ function SeatingArrangement({ onGoToReports }) {
       return
     }
 
-    if (
-      selectedDragIds.length !==
-      dragGroupSize
-    ) {
-      setUnassignedMessage(
-        `Select exactly ${dragGroupSize} unassigned students first.`
-      )
-      return
-    }
-
     const selectedUnassigned =
       getSelectedUnassignedStudents()
 
@@ -6015,23 +5983,12 @@ function SeatingArrangement({ onGoToReports }) {
     let currentSelection = [...selectedDragIds]
 
     if (!currentSelection.includes(studentId)) {
-      if (dragGroupSize !== 1) {
-        event.preventDefault()
-        setManualMessage(
-          `Select exactly ${dragGroupSize} students first, then drag any selected student.`
-        )
-        return
-      }
-
       currentSelection = [studentId]
       setSelectedDragIds(currentSelection)
     }
 
-    if (currentSelection.length !== dragGroupSize) {
+    if (currentSelection.length === 0) {
       event.preventDefault()
-      setManualMessage(
-        `Select exactly ${dragGroupSize} students before dragging.`
-      )
       return
     }
 
@@ -6250,7 +6207,6 @@ function SeatingArrangement({ onGoToReports }) {
   useEffect(() => {
     if (
       !manualDragMode ||
-      !autoScrollEnabled ||
       draggingIds.length === 0
     ) {
       return undefined
@@ -6357,7 +6313,6 @@ function SeatingArrangement({ onGoToReports }) {
     }
   }, [
     manualDragMode,
-    autoScrollEnabled,
     draggingIds.length,
   ])
 
@@ -9669,19 +9624,6 @@ function repairAllRemainingClassroomConflicts(
             </div>
 
             <div className="flex flex-wrap items-center gap-3">
-              <label className="flex items-center gap-2 text-sm font-semibold text-slate-700">
-                Students to move
-                <input
-                  type="number"
-                  min="1"
-                  value={dragGroupSize}
-                  onChange={(event) =>
-                    handleDragGroupSizeChange(event.target.value)
-                  }
-                  className="w-20 px-3 py-2 rounded-lg border border-slate-300 outline-none focus:border-blue-500"
-                />
-              </label>
-
               <button
                 onClick={() => {
                   const next = !manualDragMode
@@ -9703,27 +9645,9 @@ function repairAllRemainingClassroomConflicts(
 
               {manualDragMode && (
                 <button
-                  onClick={() =>
-                    setAutoScrollEnabled(
-                      (previous) => !previous
-                    )
-                  }
-                  className={`px-4 py-2 rounded-lg font-semibold ${
-                    autoScrollEnabled
-                      ? "bg-blue-600 text-white"
-                      : "bg-slate-100 text-slate-700"
-                  }`}
-                >
-                  Auto Scroll {autoScrollEnabled ? "ON" : "OFF"}
-                </button>
-              )}
-
-              {manualDragMode && (
-                <button
                   onClick={moveSelectedStudentsToUnassigned}
                   disabled={
-                    selectedDragIds.length === 0 ||
-                    selectedDragIds.length !== dragGroupSize
+                    selectedDragIds.length === 0
                   }
                   className="px-4 py-2 rounded-lg bg-amber-600 text-white font-semibold disabled:opacity-40 disabled:cursor-not-allowed"
                 >
@@ -9745,17 +9669,17 @@ function repairAllRemainingClassroomConflicts(
           {manualDragMode && (
             <div className="mt-4 flex flex-wrap items-center gap-3">
               <span className={`px-3 py-2 rounded-lg text-sm font-semibold ${
-                selectedDragIds.length === dragGroupSize
+                selectedDragIds.length > 0
                   ? "bg-green-50 text-green-700 border border-green-200"
                   : "bg-blue-50 text-blue-700 border border-blue-200"
               }`}>
-                Selected {selectedDragIds.length} / {dragGroupSize}
+                Selected {selectedDragIds.length} student{selectedDragIds.length === 1 ? "" : "s"}
               </span>
 
               <span className="text-sm text-slate-500">
-                {selectedDragIds.length === dragGroupSize
-                  ? "Ready to drag. Target seats will highlight automatically."
-                  : `Click ${dragGroupSize - selectedDragIds.length} more student${dragGroupSize - selectedDragIds.length === 1 ? "" : "s"}.`}
+                {selectedDragIds.length > 0
+                  ? "You can select as many students as needed."
+                  : "Click the students you want to move."}
               </span>
 
               {manualMessage && (
@@ -9770,8 +9694,8 @@ function repairAllRemainingClassroomConflicts(
                 </span>
               )}
 
-              {selectedDragIds.length === dragGroupSize &&
-                getSelectedUnassignedStudents().length === dragGroupSize && (
+              {selectedDragIds.length > 0 &&
+                getSelectedUnassignedStudents().length === selectedDragIds.length && (
                   <div className="w-full mt-3 rounded-xl border border-emerald-200 bg-emerald-50 p-4">
                     <div className="flex flex-wrap items-center justify-between gap-3">
                       <div>
@@ -10655,13 +10579,13 @@ function repairAllRemainingClassroomConflicts(
 
           {manualDragMode && (
             <p className="text-xs text-slate-600 mt-2">
-              Manual mode: select the required number of unassigned students below, then choose a destination room with enough empty seats.
+              Manual mode: select as many unassigned students as you need, then choose a destination room with enough empty seats.
             </p>
           )}
 
           {manualDragMode &&
-            selectedDragIds.length === dragGroupSize &&
-            getSelectedUnassignedStudents().length === dragGroupSize && (
+            selectedDragIds.length > 0 &&
+            getSelectedUnassignedStudents().length === selectedDragIds.length && (
               <div className="mt-4 rounded-xl border border-emerald-200 bg-emerald-50 p-4">
                 <div className="flex flex-wrap items-center justify-between gap-3">
                   <div>
